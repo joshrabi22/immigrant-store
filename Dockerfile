@@ -30,8 +30,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Install production dependencies only
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Use npm install (not ci) to resolve platform-specific binaries (sharp) on Linux
+COPY package.json ./
+RUN npm install --omit=dev
 
 # Install Playwright Chromium
 RUN npx playwright install chromium
