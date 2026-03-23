@@ -1,0 +1,29 @@
+{
+  "name": "immigrant-store",
+  "version": "0.2.0",
+  "description": "IMMIGRANT luxury streetwear — product sourcing, curation, and Shopify publishing",
+  "private": true,
+  "scripts": {
+    "setup-db": "node db.js",
+    "scrape": "node scraper.js",
+    "scrape:suggested": "node scraper.js suggested",
+    "build-taste": "node taste-builder.js",
+    "seed": "node seed-orders.js",
+    "source:cj": "node cj.js",
+    "score": "node scorer.js",
+    "server": "node server.js",
+    "build": "cd client && npx vite build",
+    "publish": "node publisher.js",
+    "monitor": "node monitor.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@libsql/client": "^0.17.2",
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "playwright": "^1.49.1",
+    "sharp": "^0.33.5"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "sections": {
+    "hero": {
+      "type": "hero",
+      "settings": {
+        "heading": "immigrant"
+      }
+    },
+    "featured": {
+      "type": "featured-collection",
+      "settings": {
+        "title": "new arrivals",
+        "limit": 12
+      }
+    }
+  },
+  "order": ["hero", "featured"]
+}

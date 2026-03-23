@@ -1,0 +1,77 @@
+<header class="site-header">
+  <a href="/" class="site-logo">immigrant</a>
+
+  <nav class="site-nav-desktop">
+    <ul class="site-nav">
+      <li><a href="/collections/new-in">New In</a></li>
+      <li class="has-dropdown">
+        <a href="/collections/men">Men</a>
+        <ul class="dropdown">
+          <li><a href="/collections/men-tops">Tops</a></li>
+          <li><a href="/collections/men-bottoms">Bottoms</a></li>
+          <li><a href="/collections/men-outerwear">Outerwear</a></li>
+          <li><a href="/collections/men-footwear">Footwear</a></li>
+        </ul>
+      </li>
+      <li class="has-dropdown">
+        <a href="/collections/women">Women</a>
+        <ul class="dropdown">
+          <li><a href="/collections/women-tops">Tops</a></li>
+          <li><a href="/collections/women-bottoms">Bottoms</a></li>
+          <li><a href="/collections/women-outerwear">Outerwear</a></li>
+          <li><a href="/collections/women-footwear">Footwear</a></li>
+        </ul>
+      </li>
+      <li><a href="/collections/unisex">Unisex</a></li>
+      <li class="has-dropdown">
+        <a href="/collections/accessories">Accessories</a>
+        <ul class="dropdown">
+          <li><a href="/collections/mens-jewelry">Men's Jewelry</a></li>
+          <li><a href="/collections/womens-jewelry">Women's Jewelry</a></li>
+          <li><a href="/collections/unisex-jewelry">Unisex Jewelry</a></li>
+          <li class="dropdown-divider"></li>
+          <li><a href="/collections/mens-belts">Men's Belts</a></li>
+          <li><a href="/collections/womens-belts">Women's Belts</a></li>
+          <li><a href="/collections/unisex-belts">Unisex Belts</a></li>
+          <li class="dropdown-divider"></li>
+          <li><a href="/collections/accessories">All Accessories</a></li>
+        </ul>
+      </li>
+    </ul>
+  </nav>
+
+  <div class="header-right">
+    <a href="/cart" class="cart-icon">Cart ({{ cart.item_count }})</a>
+    <button class="mobile-toggle" aria-label="Menu">
+      <span></span><span></span>
+    </button>
+  </div>
+</header>
+
+<!-- Mobile nav -->
+<nav class="mobile-nav">
+  <a href="/collections/new-in">New In</a>
+  <a href="/collections/men-tops">Men — Tops</a>
+  <a href="/collections/men-bottoms">Men — Bottoms</a>
+  <a href="/collections/men-outerwear">Men — Outerwear</a>
+  <a href="/collections/men-footwear">Men — Footwear</a>
+  <a href="/collections/women-tops">Women — Tops</a>
+  <a href="/collections/women-bottoms">Women — Bottoms</a>
+  <a href="/collections/women-outerwear">Women — Outerwear</a>
+  <a href="/collections/women-footwear">Women — Footwear</a>
+  <a href="/collections/unisex">Unisex</a>
+  <a href="/collections/mens-jewelry">Jewelry — Men's</a>
+  <a href="/collections/womens-jewelry">Jewelry — Women's</a>
+  <a href="/collections/unisex-jewelry">Jewelry — Unisex</a>
+  <a href="/collections/mens-belts">Belts — Men's</a>
+  <a href="/collections/womens-belts">Belts — Women's</a>
+  <a href="/collections/unisex-belts">Belts — Unisex</a>
+  <a href="/collections/accessories">All Accessories</a>
+</nav>
+
+{% schema %}
+{
+  "name": "Header",
+  "settings": []
+}
+{% endschema %}

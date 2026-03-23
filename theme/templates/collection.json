@@ -1,0 +1,11 @@
+{
+  "sections": {
+    "main": {
+      "type": "featured-collection",
+      "settings": {
+        "limit": 24
+      }
+    }
+  },
+  "order": ["main"]
+}

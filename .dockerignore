@@ -1,0 +1,12 @@
+node_modules/
+client/node_modules/
+client/dist/
+.env
+data.db
+images/
+browser-profile/
+.cj-token.json
+debug-page.html
+debug-suggested.html
+.claude/
+.git/

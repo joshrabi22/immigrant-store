@@ -1,0 +1,47 @@
+<div class="product-detail">
+  <div class="product-gallery">
+    {% for image in product.images %}
+      <img
+        src="{{ image | image_url: width: 800 }}"
+        alt="{{ product.title }}"
+        loading="lazy"
+      >
+    {% endfor %}
+  </div>
+
+  <div class="product-info">
+    <h1 class="product-title">{{ product.title }}</h1>
+    <div class="product-price">{{ product.price | money }}</div>
+
+    {% if product.description != blank %}
+      <div class="product-description">{{ product.description }}</div>
+    {% endif %}
+
+    <form action="/cart/add" method="post">
+      <input type="hidden" name="id" value="{{ product.selected_or_first_available_variant.id }}">
+
+      {% if product.has_only_default_variant == false %}
+        <div class="size-selector">
+          {% for variant in product.variants %}
+            <button
+              type="button"
+              class="size-option {% if forloop.first %}active{% endif %}"
+              data-variant-id="{{ variant.id }}"
+            >
+              {{ variant.title }}
+            </button>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <button type="submit" class="add-to-cart">Add to Cart</button>
+    </form>
+  </div>
+</div>
+
+{% schema %}
+{
+  "name": "Product Detail",
+  "settings": []
+}
+{% endschema %}

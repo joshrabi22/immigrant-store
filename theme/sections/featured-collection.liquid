@@ -1,0 +1,41 @@
+{% if section.settings.collection %}
+  {% assign collection = collections[section.settings.collection] %}
+{% else %}
+  {% assign collection = collections.all %}
+{% endif %}
+
+<h2 class="section-title">{{ section.settings.title | default: 'new arrivals' }}</h2>
+
+<div class="product-grid">
+  {% for product in collection.products limit: section.settings.limit %}
+    {% render 'product-card', product: product %}
+  {% endfor %}
+</div>
+
+{% schema %}
+{
+  "name": "Featured Collection",
+  "settings": [
+    {
+      "type": "text",
+      "id": "title",
+      "label": "Section title",
+      "default": "new arrivals"
+    },
+    {
+      "type": "collection",
+      "id": "collection",
+      "label": "Collection"
+    },
+    {
+      "type": "range",
+      "id": "limit",
+      "label": "Products to show",
+      "min": 4,
+      "max": 24,
+      "step": 4,
+      "default": 12
+    }
+  ]
+}
+{% endschema %}

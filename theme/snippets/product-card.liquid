@@ -1,0 +1,22 @@
+<a href="{{ product.url }}" class="product-card">
+  <div class="product-card-images">
+    {% if product.featured_image %}
+      <img
+        src="{{ product.featured_image | image_url: width: 600 }}"
+        alt="{{ product.title }}"
+        loading="lazy"
+      >
+    {% endif %}
+    {% if product.images[1] %}
+      <img
+        src="{{ product.images[1] | image_url: width: 600 }}"
+        alt="{{ product.title }}"
+        loading="lazy"
+      >
+    {% endif %}
+  </div>
+  <div class="product-card-info">
+    <div class="product-card-name">{{ product.title }}</div>
+    <div class="product-card-price">{{ product.price | money }}</div>
+  </div>
+</a>
