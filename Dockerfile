@@ -1,3 +1,21 @@
+##############################################
+# Stage 1 — build the React client
+##############################################
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Install client dependencies (including devDeps for Vite)
+COPY client/package.json client/package-lock.json ./client/
+RUN cd client && npm ci
+
+# Build the client
+COPY client/ ./client/
+RUN cd client && npx vite build
+
+##############################################
+# Stage 2 — production runtime
+##############################################
 FROM node:20-slim
 
 # Install dependencies for Playwright Chromium
@@ -10,21 +28,18 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install root dependencies
+# Install production dependencies only
 COPY package.json package-lock.json ./
-RUN npm ci --production
+RUN npm ci --omit=dev
 
 # Install Playwright Chromium
 RUN npx playwright install chromium
 
-# Install client dependencies and build
-COPY client/package.json client/package-lock.json ./client/
-RUN cd client && npm ci --production
-COPY client/ ./client/
-RUN cd client && npx vite build
-
 # Copy source
 COPY . .
+
+# Copy built client from builder stage
+COPY --from=builder /app/client/dist ./client/dist
 
 # Create image directories
 RUN mkdir -p images/orders images/candidates images/processed
