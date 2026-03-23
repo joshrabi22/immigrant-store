@@ -104,11 +104,27 @@ Technical decisions and the reasoning behind them.
 
 ---
 
-### Express server with in-memory publish jobs
+### Edit Suite as full-screen flow (not a tab)
 
-**Decision:** Track Shopify publish progress in memory (not database) using a job ID returned to the client.
+**Decision:** The Edit Suite is a full-screen overlay launched from My Picks, not a permanent tab. Navigation stays SWIPE / MY PICKS / LIVE.
 
-**Why:** Publishing is an async operation polled by the Launch tab every 2 seconds. In-memory tracking is simpler than a database table for a single-user tool. If the server restarts during publishing, the worst case is a stale progress bar.
+**Why:** The edit flow is sequential (one product at a time, auto-advance on publish/skip) and needs full screen real estate for the photo editor + details. Making it a tab would waste space on the queue/skipped state management. The full-screen overlay pattern keeps the tab bar clean while giving the editor maximum viewport.
+
+---
+
+### Per-product publish (not bulk)
+
+**Decision:** Products publish individually from the Edit Suite via "Publish to Shopify" button, not in a bulk batch.
+
+**Why:** Each product needs editing before publishing — name, description, price, images. Bulk publish would skip this quality step. Per-product publish also means instant feedback ("Published!") and the ability to publish as you edit rather than batching everything.
+
+---
+
+### Image enhancement as 6-step pipeline
+
+**Decision:** Auto-enhance applies: warm tone correction, gentle S-curve contrast, slight desaturation (13%), subtle sharpening, and 800x1000 crop with #F5F2ED padding. Uses Sharp.js, not external APIs.
+
+**Why:** Every AliExpress product image needs the same treatment to look like it was shot for IMMIGRANT's brand. The 6 steps approximate a brand photographer's post-processing: warm natural light feel, editorial contrast, muted palette. The before/after comparison lets the user override if the enhancement doesn't work for a specific image.
 
 ---
 

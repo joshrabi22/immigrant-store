@@ -19,12 +19,17 @@ Phase 1 (taste profiling) and Phase 2 (sourcing, curation, publishing) are compl
 - CJ Dropshipping API sourcer (`node cj.js`) — keyword search from taste profile
 - Past orders seeded into candidates (`node seed-orders.js`)
 
-**Scoring & Curation:**
-- Scorer (`node scorer.js`) — Claude vision analysis scored against taste profile on 5 dimensions (aesthetic 30%, color 20%, silhouette 20%, material 15%, style tags 15%). 7+ enters swipe queue.
-- Swipe UI (React + Vite) — SWIPE / MY PICKS / LAUNCH tabs
-- Namer (`namer.js`) — Claude vision generates 2-3 word brand names, creative color names, size mapping
-- Pricer (`pricer.js`) — category-aware pricing bands, 2.5x floor, luxury score adjustment, round to 8 or 0
-- Image processor (`images.js`) — remove.bg background removal, sharp normalization to 800x1000, auto-flagging
+**Curation Flow: SWIPE → MY PICKS → EDIT SUITE → LIVE**
+- Swipe UI — approve/reject products, gender filter (M/W/U), undo
+- My Picks — grid of approved products with status dots (grey=saved, sand=edited, black=live)
+- Edit Suite — full-screen per-product editor with:
+  - Photo editor: remove background, auto-enhance (warm tone, contrast, desaturate, crop)
+  - AI name generator (2-3 word minimal names, creative colors, sizes)
+  - AI description generator (Celine/Acne Studios voice, 1-3 sentences)
+  - Category, gender, price, colors, sizes controls
+  - Skip / Publish actions per product
+  - Skipped items holding area with resume
+- Live tab — all published products with green dot, unpublish capability
 
 **Publishing:**
 - Shopify publisher (`publisher.js`) — creates products via Admin REST API, brand-voice descriptions, variant setup

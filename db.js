@@ -98,6 +98,13 @@ async function initSchema(db) {
     ["product_url", "TEXT"],
     ["gender", "TEXT DEFAULT 'unisex'"],
     ["detected_category", "TEXT"],
+    ["edited_name", "TEXT"],
+    ["edited_description", "TEXT"],
+    ["edited_price", "REAL"],
+    ["edited_colors", "TEXT"],     // JSON array of color names
+    ["edited_sizes", "TEXT"],      // JSON array of selected sizes
+    ["shopify_url", "TEXT"],
+    ["original_image_path", "TEXT"], // backup before enhancement
   ];
 
   // Get existing columns
