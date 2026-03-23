@@ -8,13 +8,14 @@ const { createClient } = require("@libsql/client");
 const path = require("path");
 
 const DB_PATH = path.join(__dirname, "data.db");
+const IS_TURSO = !!process.env.TURSO_DATABASE_URL;
 
 let _client = null;
 
 function getDb() {
   if (_client) return _client;
 
-  if (process.env.TURSO_DATABASE_URL) {
+  if (IS_TURSO) {
     _client = createClient({
       url: process.env.TURSO_DATABASE_URL,
       authToken: process.env.TURSO_AUTH_TOKEN,
@@ -29,10 +30,21 @@ function getDb() {
 }
 
 async function initSchema(db) {
-  console.log("[db] Initializing schema...");
+  console.log(`[db] Initializing schema (turso=${IS_TURSO})...`);
 
-  // Create tables one at a time (executeMultiple not reliable on Turso HTTP)
-  const tables = [
+  // First check if tables already exist by trying a simple SELECT
+  try {
+    const result = await db.execute("SELECT COUNT(*) as c FROM candidates");
+    const count = result.rows[0]?.c || 0;
+    console.log(`[db] Tables exist. Candidates: ${count}. Skipping schema creation.`);
+    return; // Tables exist, nothing to do
+  } catch (err) {
+    console.log(`[db] Tables don't exist yet (${err.message}). Creating...`);
+  }
+
+  // Tables don't exist — create them. Only runs on fresh database.
+  // Use simple SQL compatible with both SQLite and Turso HTTP.
+  const createStatements = [
     `CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       product_title TEXT NOT NULL,
@@ -42,7 +54,7 @@ async function initSchema(db) {
       price REAL,
       seller_id TEXT,
       order_date TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS candidates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,20 +67,40 @@ async function initSchema(db) {
       shipping_cost REAL,
       score REAL,
       status TEXT DEFAULT 'new',
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT,
+      immigrant_name TEXT,
+      immigrant_description TEXT,
+      retail_price REAL,
+      price_reasoning TEXT,
+      image_flags TEXT,
+      processed_images TEXT,
+      shopify_product_id TEXT,
+      score_breakdown TEXT,
+      namer_data TEXT,
+      cj_product_id TEXT,
+      product_url TEXT,
+      gender TEXT DEFAULT 'unisex',
+      detected_category TEXT,
+      edited_name TEXT,
+      edited_description TEXT,
+      edited_price REAL,
+      edited_colors TEXT,
+      edited_sizes TEXT,
+      shopify_url TEXT,
+      original_image_path TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS taste_profile (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       key TEXT NOT NULL,
       value TEXT NOT NULL,
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS swipe_decisions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       candidate_id INTEGER NOT NULL,
       decision TEXT NOT NULL,
       batch_number INTEGER,
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT
     )`,
     `CREATE TABLE IF NOT EXISTS image_processing (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,65 +110,24 @@ async function initSchema(db) {
       flags TEXT,
       hidden INTEGER DEFAULT 0,
       sort_order INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now'))
+      created_at TEXT
     )`,
   ];
 
-  for (const sql of tables) {
+  for (const sql of createStatements) {
     try {
       await db.execute(sql);
     } catch (err) {
-      console.error(`[db] Table creation error: ${err.message}`);
+      console.error(`[db] Create table error: ${err.message}`);
     }
   }
 
-  // Phase 2 columns — add safely
-  const phase2Columns = [
-    ["immigrant_name", "TEXT"],
-    ["immigrant_description", "TEXT"],
-    ["retail_price", "REAL"],
-    ["price_reasoning", "TEXT"],
-    ["image_flags", "TEXT"],
-    ["processed_images", "TEXT"],
-    ["shopify_product_id", "TEXT"],
-    ["score_breakdown", "TEXT"],
-    ["namer_data", "TEXT"],
-    ["cj_product_id", "TEXT"],
-    ["product_url", "TEXT"],
-    ["gender", "TEXT DEFAULT 'unisex'"],
-    ["detected_category", "TEXT"],
-    ["edited_name", "TEXT"],
-    ["edited_description", "TEXT"],
-    ["edited_price", "REAL"],
-    ["edited_colors", "TEXT"],
-    ["edited_sizes", "TEXT"],
-    ["shopify_url", "TEXT"],
-    ["original_image_path", "TEXT"],
-  ];
-
-  // Get existing columns
-  let existingCols = new Set();
-  try {
-    const colResult = await db.execute("PRAGMA table_info(candidates)");
-    existingCols = new Set(colResult.rows.map((r) => r.name || r[1]));
-  } catch (err) {
-    console.error(`[db] PRAGMA error: ${err.message}`);
-  }
-
-  for (const [col, type] of phase2Columns) {
-    if (!existingCols.has(col)) {
-      try {
-        await db.execute(`ALTER TABLE candidates ADD COLUMN ${col} ${type}`);
-      } catch (_) {} // Column may already exist
-    }
-  }
-
-  // Verify — count candidates to confirm connection works
+  // Verify
   try {
     const result = await db.execute("SELECT COUNT(*) as c FROM candidates");
-    console.log(`[db] Schema ready. Candidates: ${result.rows[0]?.c || 0}`);
+    console.log(`[db] Schema created. Candidates: ${result.rows[0]?.c || 0}`);
   } catch (err) {
-    console.error(`[db] Verification query failed: ${err.message}`);
+    console.error(`[db] Verification failed: ${err.message}`);
   }
 }
 

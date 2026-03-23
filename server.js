@@ -57,12 +57,16 @@ app.get("/api/health", (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.get("/api/stats", async (req, res) => {
+  console.log(`[api/stats] called — dbReady=${dbReady} db=${!!db} dbError=${dbError}`);
   if (!dbReady || !db) {
-    return res.json({ total: 0, unswiped: 0, approved: 0, skipped: 0, published: 0, dbReady: false });
+    console.log(`[api/stats] DB not ready, returning zeros`);
+    return res.json({ total: 0, unswiped: 0, approved: 0, skipped: 0, published: 0, dbReady: false, dbError: dbError || null });
   }
   try {
     const { queryOne } = require("./db");
+    console.log(`[api/stats] Querying total...`);
     const total = await queryOne(db, "SELECT COUNT(*) as c FROM candidates");
+    console.log(`[api/stats] total raw: ${JSON.stringify(total)}`);
     const unswiped = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND id NOT IN (SELECT candidate_id FROM swipe_decisions)");
     const approved = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status IN ('approved', 'editing')");
     const skipped = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'skipped'");
@@ -71,9 +75,11 @@ app.get("/api/stats", async (req, res) => {
       total: total?.c || 0, unswiped: unswiped?.c || 0,
       approved: approved?.c || 0, skipped: skipped?.c || 0, published: published?.c || 0,
     };
+    console.log(`[api/stats] returning: ${JSON.stringify(stats)}`);
     res.json(stats);
   } catch (err) {
     console.error(`[api/stats] ERROR: ${err.message}`);
+    console.error(`[api/stats] Stack: ${err.stack}`);
     res.json({ total: 0, unswiped: 0, approved: 0, skipped: 0, published: 0, error: err.message });
   }
 });
@@ -374,23 +380,54 @@ app.listen(PORT, () => {
   console.log(`[startup] Server listening on port ${PORT}`);
   console.log(`[startup] IS_CLOUD=${IS_CLOUD}`);
   console.log(`[startup] TURSO_DATABASE_URL set: ${!!process.env.TURSO_DATABASE_URL}`);
+  console.log(`[startup] TURSO_DATABASE_URL value: ${(process.env.TURSO_DATABASE_URL || '').substring(0, 40)}...`);
   console.log(`[startup] TURSO_AUTH_TOKEN set: ${!!process.env.TURSO_AUTH_TOKEN}`);
+  console.log(`[startup] TURSO_AUTH_TOKEN starts with: ${(process.env.TURSO_AUTH_TOKEN || '').substring(0, 20)}...`);
   console.log(`[startup] RAILWAY_ENVIRONMENT: ${process.env.RAILWAY_ENVIRONMENT || 'not set'}`);
 });
 
 // Connect DB async — server is already responding to healthchecks
 (async () => {
   try {
-    const { getDb, initSchema, queryAll } = require("./db");
+    console.log(`[db-init] Requiring ./db...`);
+    const { getDb, initSchema, queryAll, queryOne } = require("./db");
+
+    console.log(`[db-init] Calling getDb()...`);
     db = getDb();
+
+    console.log(`[db-init] Calling initSchema()...`);
     await initSchema(db);
 
-    const statusBreakdown = await queryAll(db, "SELECT status, COUNT(*) as c FROM candidates GROUP BY status");
-    console.log(`[startup] DB ready. Status breakdown: ${JSON.stringify(statusBreakdown)}`);
+    // Direct count query with full logging
+    console.log(`[db-init] Running: SELECT COUNT(*) as c FROM candidates`);
+    const countResult = await db.execute("SELECT COUNT(*) as c FROM candidates");
+    console.log(`[db-init] Raw count result: ${JSON.stringify(countResult)}`);
+    console.log(`[db-init] countResult.rows: ${JSON.stringify(countResult.rows)}`);
+    console.log(`[db-init] countResult.rows[0]: ${JSON.stringify(countResult.rows[0])}`);
+
+    // Also try via queryOne helper
+    const countViaHelper = await queryOne(db, "SELECT COUNT(*) as c FROM candidates");
+    console.log(`[db-init] Via queryOne: ${JSON.stringify(countViaHelper)}`);
+
+    // Status breakdown
+    console.log(`[db-init] Running: SELECT status, COUNT(*) as c FROM candidates GROUP BY status`);
+    const statusResult = await db.execute("SELECT status, COUNT(*) as c FROM candidates GROUP BY status");
+    console.log(`[db-init] Status raw rows: ${JSON.stringify(statusResult.rows)}`);
+
+    // Sample a row to verify data is there
+    console.log(`[db-init] Running: SELECT id, title, status FROM candidates LIMIT 1`);
+    const sampleResult = await db.execute("SELECT id, title, status FROM candidates LIMIT 1");
+    console.log(`[db-init] Sample row: ${JSON.stringify(sampleResult.rows[0])}`);
+
+    // Check tables exist
+    const tablesResult = await db.execute("SELECT name FROM sqlite_master WHERE type='table'");
+    console.log(`[db-init] Tables: ${tablesResult.rows.map(r => r.name).join(', ')}`);
+
     dbReady = true;
+    console.log(`[db-init] SUCCESS — dbReady=true`);
   } catch (err) {
     dbError = err.message;
-    console.error(`[startup] DB FAILED: ${err.message}`);
-    console.error(err.stack);
+    console.error(`[db-init] FAILED: ${err.message}`);
+    console.error(`[db-init] Stack: ${err.stack}`);
   }
 })();
