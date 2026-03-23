@@ -6,8 +6,9 @@ FROM node:20-slim AS builder
 WORKDIR /app
 
 # Install client dependencies (including devDeps for Vite)
-COPY client/package.json client/package-lock.json ./client/
-RUN cd client && npm ci
+# Use npm install (not ci) to resolve platform-specific binaries on Linux
+COPY client/package.json ./client/
+RUN cd client && npm install
 
 # Build the client
 COPY client/ ./client/
