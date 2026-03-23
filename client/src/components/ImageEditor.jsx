@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { updatePick } from "../api";
+import imgUrl from "../imgUrl";
 
 const styles = {
   overlay: {
@@ -91,9 +92,9 @@ export default function ImageEditor({ candidateId, images, onClose }) {
 
         <div style={styles.grid}>
           {localImages.map((img, idx) => {
-            const src = img.processed_path
-              ? `/images/${img.processed_path.replace("images/", "")}`
-              : img.original_url;
+            const src = img.original_url
+              ? imgUrl({ image_url: img.original_url, image_path: img.processed_path })
+              : img.processed_path ? `/images/${img.processed_path.replace("images/", "")}` : null;
 
             let flags = [];
             try { flags = JSON.parse(img.flags || "[]"); } catch (_) {}

@@ -244,8 +244,9 @@ export default function SwipeTab() {
         {imgSrc && (
           <img
             src={imgSrc} alt={c.title}
-            style={{ width: "100%", aspectRatio: "4/5", objectFit: "cover", display: "block" }}
+            style={{ width: "100%", aspectRatio: "4/5", objectFit: "cover", display: "block", background: "#E8E4DF" }}
             draggable={false}
+            onError={(e) => { e.target.style.display = "none"; }}
           />
         )}
         <div style={{ padding: "14px 18px" }}>
