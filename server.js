@@ -41,19 +41,25 @@ Return only the description, nothing else.`;
 // SWIPE
 // ---------------------------------------------------------------------------
 
+const IS_CLOUD = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.TURSO_DATABASE_URL;
+
 app.get("/api/swipe/batch", async (req, res) => {
   try {
     const gf = req.query.gender;
     const gc = gf ? `AND c.gender = '${gf}'` : "";
+    // Require either image_path or image_url
     const candidates = await queryAll(db, `
-      SELECT c.* FROM candidates c WHERE c.status = 'new' AND c.image_path IS NOT NULL
+      SELECT c.* FROM candidates c WHERE c.status = 'new'
+      AND (c.image_path IS NOT NULL OR c.image_url IS NOT NULL)
       AND c.id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}
       ORDER BY c.created_at DESC LIMIT 100
     `);
-    const filtered = candidates.filter((c) => {
-      try { return fs.statSync(path.join(__dirname, c.image_path)).size >= 5000; } catch (_) { return false; }
+    // On local: filter out missing/tiny files. On cloud: skip file check (images served from URLs).
+    const filtered = IS_CLOUD ? candidates : candidates.filter((c) => {
+      if (!c.image_path) return !!c.image_url;
+      try { return fs.statSync(path.join(__dirname, c.image_path)).size >= 5000; } catch (_) { return !!c.image_url; }
     });
-    const count = await queryOne(db, `SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND image_path IS NOT NULL AND id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}`);
+    const count = await queryOne(db, `SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND (image_path IS NOT NULL OR image_url IS NOT NULL) AND id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}`);
     res.json({ candidates: filtered, total_remaining: count?.c || 0 });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

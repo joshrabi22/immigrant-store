@@ -3,6 +3,7 @@ import {
   getEditItem, saveEdit, skipItem, generateName, generateDescription,
   removeBg, enhanceImage, applyEnhanced, revertImage, publishItem,
 } from "../api";
+import imgUrl from "../imgUrl";
 
 const CATEGORIES = ["tops", "bottoms", "outerwear", "footwear", "jewelry", "belts", "accessories"];
 const GENDERS = ["mens", "womens", "unisex"];
@@ -132,7 +133,7 @@ export default function ProductEditor({ id, queuePosition, queueTotal, onNext, o
 
   if (loading || !item) return <div style={S.full}><p style={S.muted}>Loading...</p></div>;
 
-  const imgSrc = item.image_path ? `/images/${item.image_path.replace("images/", "")}?t=${Date.now()}` : null;
+  const imgSrc = imgUrl(item, true);
   const enhancedSrc = enhancedPath ? `/images/${enhancedPath.replace("images/", "")}?t=${Date.now()}` : null;
   const costCalc = item.price ? `$${item.price} cost × 2.5 = $${Math.round(item.price * 2.5)}` : "";
 

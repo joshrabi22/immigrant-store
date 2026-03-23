@@ -19,9 +19,10 @@ function getDb() {
       url: process.env.TURSO_DATABASE_URL,
       authToken: process.env.TURSO_AUTH_TOKEN,
     });
-    console.log("Connected to Turso cloud database");
+    console.log(`[db] Connected to Turso cloud: ${process.env.TURSO_DATABASE_URL}`);
   } else {
     _client = createClient({ url: `file:${DB_PATH}` });
+    console.log(`[db] Using local SQLite: ${DB_PATH}`);
   }
 
   return _client;

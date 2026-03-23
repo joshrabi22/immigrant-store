@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getSwipeBatch, postDecision, postUndo, getStats, updateGender, updateCategory } from "../api";
+import imgUrl from "../imgUrl";
 
 const GENDER_COLORS = { mens: "#1A1A1A", womens: "#C4A882", unisex: "#6B6B6B" };
 const GENDER_LABELS = { mens: "M", womens: "W", unisex: "U" };
@@ -169,7 +170,7 @@ export default function SwipeTab() {
   }
 
   const c = batch[index];
-  const imgSrc = c.image_path ? `/images/${c.image_path.replace("images/", "")}` : c.image_url;
+  const imgSrc = imgUrl(c);
   const gender = c.gender || "unisex";
   const cat = c.detected_category || "accessories";
 

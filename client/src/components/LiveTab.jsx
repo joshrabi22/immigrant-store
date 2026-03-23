@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getLive, unpublishItem } from "../api";
+import imgUrl from "../imgUrl";
 
 export default function LiveTab() {
   const [items, setItems] = useState([]);
@@ -39,7 +40,7 @@ export default function LiveTab() {
 
       <div style={{ columnCount: 3, columnGap: 12 }}>
         {items.map((item) => {
-          const img = item.image_path ? `/images/${item.image_path.replace("images/", "")}` : null;
+          const img = imgUrl(item);
           const storeUrl = item.shopify_url || (item.shopify_product_id ? `https://${item.shopify_url || "22immigrant.myshopify.com"}/products/${item.shopify_product_id}` : null);
 
           return (

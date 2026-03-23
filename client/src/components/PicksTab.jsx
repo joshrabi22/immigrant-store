@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getPicks, deletePick } from "../api";
+import imgUrl from "../imgUrl";
 
 const STATUS_DOT = {
   approved: { bg: "#D9D4CE", label: "saved" },       // grey
@@ -53,7 +54,7 @@ export default function PicksTab({ onStartEdit }) {
 
       <div style={{ columnCount: 3, columnGap: 12 }}>
         {picks.map((p) => {
-          const img = p.image_path ? `/images/${p.image_path.replace("images/", "")}` : null;
+          const img = imgUrl(p);
           const dot = STATUS_DOT[p.status] || STATUS_DOT.approved;
 
           return (

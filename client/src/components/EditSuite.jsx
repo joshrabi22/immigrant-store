@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getEditQueue, getEditSkipped, unskipItem, getStats, deletePick } from "../api";
+import imgUrl from "../imgUrl";
 import ProductEditor from "./ProductEditor";
 
 export default function EditSuite({ startId, onExit }) {
@@ -130,7 +131,7 @@ export default function EditSuite({ startId, onExit }) {
       {/* Skipped grid */}
       <div style={{ padding: "0 16px 80px", display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
         {skipped.map((item) => {
-          const img = item.image_path ? `/images/${item.image_path.replace("images/", "")}` : null;
+          const img = imgUrl(item);
           return (
             <div key={item.id} style={{ background: "#fff", borderRadius: 6, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,0.05)" }}>
               {img && <img src={img} alt="" style={{ width: "100%", aspectRatio: "4/5", objectFit: "cover" }} />}
