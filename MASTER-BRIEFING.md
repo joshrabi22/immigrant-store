@@ -2,107 +2,142 @@
 
 ## Brand Overview
 
-**IMMIGRANT** is a luxury streetwear brand sold via Shopify dropshipping. The brand curates high-quality pieces from global suppliers, applying a cohesive aesthetic identity that elevates sourced products into a branded collection.
+**IMMIGRANT** is a luxury streetwear brand sold via Shopify dropshipping at **22immigrant.myshopify.com**. The brand curates high-quality pieces from global suppliers (primarily AliExpress), applies a cohesive aesthetic identity, and publishes them as a branded collection.
 
-The business model: source products (primarily via AliExpress and similar platforms), curate based on a defined taste profile, publish to Shopify with branded presentation, and promote through automated Instagram content.
+Target aesthetic: minimal, oversized, neutral palette, cotton/denim heavy. Think Acne Studios meets COS meets early Yeezy Season.
 
 ## System Architecture
 
-The IMMIGRANT automation system is built in four phases, each adding a layer of capability:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     IMMIGRANT System                         │
+│                                                              │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │   RAILWAY    │  │   RAILWAY    │  │     TURSO        │   │
+│  │   Web App    │  │   Worker     │  │   Cloud SQLite   │   │
+│  │             │  │              │  │                  │   │
+│  │  server.js   │  │ alistream.js │  │  665 candidates  │   │
+│  │  React UI    │  │ Playwright   │  │  122 orders      │   │
+│  │  Edit Suite  │  │ 24/7 scrape  │  │  108 decisions   │   │
+│  └──────┬──────┘  └──────┬───────┘  └────────┬─────────┘   │
+│         │                │                    │              │
+│         └────────────────┴────────────────────┘              │
+│                          │                                   │
+│  ┌───────────────────────┴────────────────────────────────┐  │
+│  │                    SHOPIFY                              │  │
+│  │  22immigrant.myshopify.com                              │  │
+│  │  Liquid theme (Farfetch-inspired)                       │  │
+│  │  18 auto-managed collections                            │  │
+│  │  DSers fulfillment integration                          │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                                                              │
+│  Phase 1: TASTE PROFILING ✓                                  │
+│  ├── 122 AliExpress orders scraped                           │
+│  ├── 76 clothing items analyzed by Claude vision             │
+│  └── taste_profile.json (minimal, oversized, cotton/denim)   │
+│                                                              │
+│  Phase 2: SOURCING & CURATION ✓ (DEPLOYED)                   │
+│  ├── alistream.js: 6-strategy continuous AliExpress stream   │
+│  ├── 3-layer junk filter: title → pixel → Claude vision      │
+│  ├── Swipe UI: Y/N approve, gender/category badges           │
+│  ├── Edit Suite: photos, AI name, AI description, pricing    │
+│  ├── publisher.js: Shopify API + 18 collections              │
+│  └── Live tab: published products with unpublish             │
+│                                                              │
+│  Phase 3: INSTAGRAM CONTENT (next)                           │
+│  ├── Product photography processing                          │
+│  ├── Caption and hashtag generation                          │
+│  ├── Content calendar and scheduling                         │
+│  └── Engagement analytics                                    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Curation Flow
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    IMMIGRANT System                      │
-│                                                          │
-│  Phase 1: TASTE PROFILING                                │
-│  ├── AliExpress order scraper (Playwright)               │
-│  ├── Claude vision image analysis                        │
-│  └── Aggregated taste profile (colors, styles, types)    │
-│                                                          │
-│  Phase 2: PRODUCT SOURCING & CURATION                    │
-│  ├── AliExpress product search/discovery                 │
-│  ├── Candidate scoring against taste profile             │
-│  ├── Price/shipping/quality filtering                    │
-│  └── Curated candidate pipeline                          │
-│                                                          │
-│  Phase 3: SHOPIFY PUBLISHING                             │
-│  ├── Product listing creation via Shopify API            │
-│  ├── Branded descriptions and imagery                    │
-│  ├── Pricing strategy automation                         │
-│  └── Inventory/fulfillment sync                          │
-│                                                          │
-│  Phase 4: INSTAGRAM CONTENT AUTOMATION                   │
-│  ├── Product photography processing                      │
-│  ├── Caption and hashtag generation                      │
-│  ├── Content calendar and scheduling                     │
-│  └── Engagement analytics                                │
-│                                                          │
-└─────────────────────────────────────────────────────────┘
+AliExpress → alistream.js → candidates table → SWIPE → MY PICKS → EDIT SUITE → SHOPIFY
+                                                  │                     │
+                                              reject               skip/publish
+                                                  ↓                     ↓
+                                              rejected            LIVE on store
 ```
+
+**SWIPE:** One card at a time. Y = approve, N = reject. Gender filter (M/W/U). Undo (Z). Queue auto-fills from alistream.js.
+
+**MY PICKS:** Grid of approved products. Status dots (grey/sand/black). "Start Editing" button launches Edit Suite.
+
+**EDIT SUITE:** Full-screen per-product editor:
+1. Photo editor — remove background, auto-enhance, before/after comparison
+2. Name — AI-generated 2-3 word minimal name (Cormorant Garamond)
+3. Description — AI-generated brand voice copy (1-3 sentences, Celine/Acne style)
+4. Details — category, gender, price, colors, sizes
+5. Actions — Skip for Now | Publish to Shopify
+
+**LIVE:** Published products grid. Green dot. View on store. Unpublish.
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Runtime | Node.js |
-| Database | SQLite (better-sqlite3) |
-| Scraping | Playwright (Chromium) |
-| AI/Vision | Claude API (@anthropic-ai/sdk) |
-| Storefront | Shopify (future) |
-| Social | Instagram API (future) |
-| Config | dotenv, .env files |
+| Layer | Technology | Status |
+|-------|-----------|--------|
+| Runtime | Node.js 20 | Deployed on Railway |
+| Database | Turso (cloud SQLite via @libsql/client) | 665 candidates |
+| Scraping | Playwright (headless Chromium) | 24/7 on Railway worker |
+| AI/Vision | Claude API (Sonnet) | Product check, gender, naming, descriptions |
+| Frontend | React + Vite | Deployed on Railway |
+| Storefront | Shopify + Liquid theme | 22immigrant.myshopify.com |
+| Fulfillment | DSers (AliExpress) | Installed + linked |
+| Images | remove.bg API + Sharp.js | Background removal + enhancement |
+| Domain | curate.22immigrant.com | DNS propagating |
 
-## Database Schema
+## Database Schema (Turso Cloud)
 
-**orders** — Scraped AliExpress purchase history
-- id, product_title, image_url, image_path, category, price, seller_id, order_date, created_at
+**orders** (122 rows) — Scraped AliExpress purchase history
 
-**candidates** — Products discovered for potential curation (Phase 2)
-- id, title, image_url, image_path, source, ali_product_id, price, shipping_cost, score, status, created_at
+**candidates** (665 rows) — Products from all sources
+- Core: id, title, image_url, image_path, source, ali_product_id, price, status
+- Scoring: score, score_breakdown
+- Gender/category: gender (mens/womens/unisex), detected_category (tops/bottoms/etc.)
+- Editing: edited_name, edited_description, edited_price, edited_colors, edited_sizes
+- Publishing: shopify_product_id, shopify_url, immigrant_name, immigrant_description
+- Images: original_image_path, processed_images, image_flags
 
-**taste_profile** — Key-value store for aggregated style analysis
-- id, key, value, created_at
+**taste_profile** (9 rows) — Aggregated style analysis
 
-## Phase 1 — Build Status
+**swipe_decisions** (108 rows) — Approve/reject history
 
-| Component | Status |
-|-----------|--------|
-| SQLite schema (all 3 tables) | Done |
-| AliExpress order scraper | Done |
-| Cookie-based session persistence | Done |
-| Order image downloading | Done |
-| Claude vision taste analysis | Done |
-| Taste profile aggregation | Done |
-| JSON + DB output | Done |
-| Console summary display | Done |
+**image_processing** — Per-image flags and processed paths
 
-### What Phase 1 produces
+## Taste Profile
 
-The taste profile captures:
-- **Dominant colors** — hex values ranked by frequency
-- **Garment types** — what categories appear most (hoodies, tees, jackets, etc.)
-- **Silhouettes** — oversized vs slim vs relaxed vs cropped
-- **Materials** — cotton, nylon, leather, etc.
-- **Style tags** — specific aesthetic descriptors (up to 5 per item)
-- **Aesthetic category** — streetwear / minimal / tailored / utility / other
-- **Overall aesthetic direction** — the dominant category across all purchases
+Dominant aesthetic: **MINIMAL** (33%) → streetwear (20%) → utility (18%)
+Colors: white, light grey, beige, black, saddle brown
+Silhouettes: oversized (27x), relaxed (19x)
+Materials: cotton (29x), denim (8x), nylon (7x)
+Style: casual, basic, vintage, retro
 
-This profile becomes the scoring rubric for Phase 2 candidate evaluation.
+## Brand Voice (Product Descriptions)
 
-## Phase 2 — Next Up
+Sparse. Declarative. Present tense. No marketing language.
 
-Product sourcing: discover new products on AliExpress, score them against the taste profile, and build a curated candidate pipeline. The `candidates` table is already scaffolded and ready.
+> "Heavyweight cotton. Dropped shoulders. Washed once."
+> "Unstructured. Falls below the knee. Worn open."
+> "Raw denim. Mid rise. Slightly tapered from the knee."
 
-## Running the System
+## Deployment
 
-```bash
-# Setup
-npm install
-npx playwright install chromium
-cp .env.example .env   # Add ANTHROPIC_API_KEY
+| Service | Platform | Status |
+|---------|----------|--------|
+| Web app (server.js + React) | Railway | Deployed |
+| Worker (alistream.js) | Railway | Deployed |
+| Database | Turso | 665 candidates migrated |
+| Storefront | Shopify | 22immigrant.myshopify.com |
+| Curation domain | curate.22immigrant.com | DNS propagating |
+| Fulfillment | DSers | Installed |
 
-# Phase 1
-node db.js             # Initialize database
-node scraper.js        # Scrape AliExpress orders (manual login on first run)
-node taste-builder.js  # Build taste profile from order images
-```
+## What's Next
+
+1. **Test full flow** — swipe → edit → publish on Railway URL
+2. **Instagram content automation** — product photography, captions, scheduling
+3. **Shopify theme deployment** — `shopify theme push` the Liquid theme
+4. **Monitoring** — dead listing checks, alistream health

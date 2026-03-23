@@ -47,21 +47,33 @@ app.get("/api/swipe/batch", async (req, res) => {
   try {
     const gf = req.query.gender;
     const gc = gf ? `AND c.gender = '${gf}'` : "";
-    // Require either image_path or image_url
-    const candidates = await queryAll(db, `
+    const sql = `
       SELECT c.* FROM candidates c WHERE c.status = 'new'
       AND (c.image_path IS NOT NULL OR c.image_url IS NOT NULL)
       AND c.id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}
       ORDER BY c.created_at DESC LIMIT 100
-    `);
-    // On local: filter out missing/tiny files. On cloud: skip file check (images served from URLs).
+    `;
+    console.log(`[api/swipe/batch] IS_CLOUD=${IS_CLOUD} gender=${gf || 'all'}`);
+    const candidates = await queryAll(db, sql);
+    console.log(`[api/swipe/batch] Query returned ${candidates.length} rows`);
+    if (candidates.length > 0) {
+      console.log(`[api/swipe/batch] First: id=${candidates[0].id} status=${candidates[0].status} img_path=${!!candidates[0].image_path} img_url=${!!candidates[0].image_url}`);
+    }
+
+    // On local: filter out missing/tiny files. On cloud: skip file check.
     const filtered = IS_CLOUD ? candidates : candidates.filter((c) => {
       if (!c.image_path) return !!c.image_url;
       try { return fs.statSync(path.join(__dirname, c.image_path)).size >= 5000; } catch (_) { return !!c.image_url; }
     });
+    console.log(`[api/swipe/batch] After filter: ${filtered.length} (IS_CLOUD=${IS_CLOUD})`);
+
     const count = await queryOne(db, `SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND (image_path IS NOT NULL OR image_url IS NOT NULL) AND id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}`);
+    console.log(`[api/swipe/batch] Total remaining: ${count?.c || 0}`);
     res.json({ candidates: filtered, total_remaining: count?.c || 0 });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error(`[api/swipe/batch] ERROR: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/api/swipe/decide", async (req, res) => {
@@ -366,11 +378,16 @@ app.get("/api/stats", async (req, res) => {
     const approved = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status IN ('approved', 'editing')");
     const skipped = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'skipped'");
     const published = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'published'");
-    res.json({
+    const stats = {
       total: total?.c || 0, unswiped: unswiped?.c || 0,
       approved: approved?.c || 0, skipped: skipped?.c || 0, published: published?.c || 0,
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    };
+    console.log(`[api/stats]`, JSON.stringify(stats));
+    res.json(stats);
+  } catch (err) {
+    console.error(`[api/stats] ERROR: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -386,12 +403,24 @@ app.get("/{*path}", (req, res) => {
 // ---------------------------------------------------------------------------
 
 (async () => {
+  console.log(`[startup] TURSO_DATABASE_URL set: ${!!process.env.TURSO_DATABASE_URL}`);
+  console.log(`[startup] TURSO_AUTH_TOKEN set: ${!!process.env.TURSO_AUTH_TOKEN}`);
+  console.log(`[startup] RAILWAY_ENVIRONMENT: ${process.env.RAILWAY_ENVIRONMENT || 'not set'}`);
+  console.log(`[startup] IS_CLOUD: ${IS_CLOUD}`);
+
   db = getDb();
   await initSchema(db);
+
+  // Verify we can actually read data
   const s = await queryOne(db, "SELECT COUNT(*) as c FROM candidates");
+  console.log(`[startup] Candidates count from DB: ${JSON.stringify(s)}`);
+
+  const statusBreakdown = await queryAll(db, "SELECT status, COUNT(*) as c FROM candidates GROUP BY status");
+  console.log(`[startup] Status breakdown: ${JSON.stringify(statusBreakdown)}`);
+
   app.listen(PORT, () => {
     console.log(`\n=== IMMIGRANT Curation Tool ===`);
-    console.log(`http://localhost:${PORT}\n`);
+    console.log(`http://localhost:${PORT}`);
     console.log(`${s?.c || 0} candidates in database\n`);
   });
 })();

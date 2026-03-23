@@ -29,9 +29,11 @@ function getDb() {
 }
 
 async function initSchema(db) {
-  // Phase 1 tables
-  await db.executeMultiple(`
-    CREATE TABLE IF NOT EXISTS orders (
+  console.log("[db] Initializing schema...");
+
+  // Create tables one at a time (executeMultiple not reliable on Turso HTTP)
+  const tables = [
+    `CREATE TABLE IF NOT EXISTS orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       product_title TEXT NOT NULL,
       image_url TEXT,
@@ -41,9 +43,8 @@ async function initSchema(db) {
       seller_id TEXT,
       order_date TEXT,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS candidates (
+    )`,
+    `CREATE TABLE IF NOT EXISTS candidates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT NOT NULL,
       image_url TEXT,
@@ -55,24 +56,21 @@ async function initSchema(db) {
       score REAL,
       status TEXT DEFAULT 'new',
       created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS taste_profile (
+    )`,
+    `CREATE TABLE IF NOT EXISTS taste_profile (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       key TEXT NOT NULL,
       value TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS swipe_decisions (
+    )`,
+    `CREATE TABLE IF NOT EXISTS swipe_decisions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       candidate_id INTEGER NOT NULL,
       decision TEXT NOT NULL,
       batch_number INTEGER,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS image_processing (
+    )`,
+    `CREATE TABLE IF NOT EXISTS image_processing (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       candidate_id INTEGER NOT NULL,
       original_url TEXT,
@@ -81,8 +79,16 @@ async function initSchema(db) {
       hidden INTEGER DEFAULT 0,
       sort_order INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
+    )`,
+  ];
+
+  for (const sql of tables) {
+    try {
+      await db.execute(sql);
+    } catch (err) {
+      console.error(`[db] Table creation error: ${err.message}`);
+    }
+  }
 
   // Phase 2 columns — add safely
   const phase2Columns = [
@@ -102,15 +108,20 @@ async function initSchema(db) {
     ["edited_name", "TEXT"],
     ["edited_description", "TEXT"],
     ["edited_price", "REAL"],
-    ["edited_colors", "TEXT"],     // JSON array of color names
-    ["edited_sizes", "TEXT"],      // JSON array of selected sizes
+    ["edited_colors", "TEXT"],
+    ["edited_sizes", "TEXT"],
     ["shopify_url", "TEXT"],
-    ["original_image_path", "TEXT"], // backup before enhancement
+    ["original_image_path", "TEXT"],
   ];
 
   // Get existing columns
-  const colResult = await db.execute("PRAGMA table_info(candidates)");
-  const existingCols = new Set(colResult.rows.map((r) => r.name || r[1]));
+  let existingCols = new Set();
+  try {
+    const colResult = await db.execute("PRAGMA table_info(candidates)");
+    existingCols = new Set(colResult.rows.map((r) => r.name || r[1]));
+  } catch (err) {
+    console.error(`[db] PRAGMA error: ${err.message}`);
+  }
 
   for (const [col, type] of phase2Columns) {
     if (!existingCols.has(col)) {
@@ -119,43 +130,41 @@ async function initSchema(db) {
       } catch (_) {} // Column may already exist
     }
   }
+
+  // Verify — count candidates to confirm connection works
+  try {
+    const result = await db.execute("SELECT COUNT(*) as c FROM candidates");
+    console.log(`[db] Schema ready. Candidates: ${result.rows[0]?.c || 0}`);
+  } catch (err) {
+    console.error(`[db] Verification query failed: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Helper wrappers for common patterns (sync-style convenience)
+// Helper wrappers
 // ---------------------------------------------------------------------------
 
-// Execute a query and return all rows
 async function queryAll(db, sql, params = []) {
   const result = await db.execute({ sql, args: params });
   return result.rows;
 }
 
-// Execute a query and return the first row
 async function queryOne(db, sql, params = []) {
   const result = await db.execute({ sql, args: params });
   return result.rows[0] || null;
 }
 
-// Execute a statement (INSERT/UPDATE/DELETE) and return { changes, lastInsertRowid }
 async function run(db, sql, params = []) {
   const result = await db.execute({ sql, args: params });
   return { changes: result.rowsAffected, lastInsertRowid: result.lastInsertRowid };
 }
 
-// Run standalone to create/reset the schema
+// Run standalone
 if (require.main === module) {
   require("dotenv").config();
   (async () => {
     const db = getDb();
     await initSchema(db);
-    console.log("Database initialized");
-
-    const tables = await db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-    console.log("Tables:", tables.rows.map((t) => t.name || t[0]).join(", "));
-
-    const cols = await db.execute("PRAGMA table_info(candidates)");
-    console.log("\nCandidates columns:", cols.rows.map((c) => c.name || c[1]).join(", "));
   })();
 }
 

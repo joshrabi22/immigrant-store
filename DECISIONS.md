@@ -4,103 +4,79 @@ Technical decisions and the reasoning behind them.
 
 ---
 
-## Phase 1
-
-### SQLite over Postgres
-
-**Decision:** Use SQLite via `better-sqlite3` for all data storage.
-
-**Why:** Single-user local tool. No need for a database server. WAL mode handles concurrent reads from the server and CLI scripts.
-
----
-
-### CDP connection to real Chrome (not Playwright-launched browser)
-
-**Decision:** Connect to the user's real Chrome via DevTools Protocol instead of launching a Playwright-controlled browser.
-
-**Why:** AliExpress aggressively detects Playwright-launched browsers. CDP connection to a real Chrome with `--remote-debugging-port=9222` avoids all bot detection.
-
----
+## Phase 1 — Taste Profiling
 
 ### Image format detection via magic bytes
 
 **Decision:** Detect actual image format from file magic bytes, not file extension.
 
-**Why:** AliExpress serves webp/png with `.jpg` extensions. The Claude API rejects mismatched media types.
+**Why:** AliExpress serves webp/png with `.jpg` extensions. The Claude API rejects mismatched media types. Magic byte detection (PNG `89 50`, WebP `52 49 46 46`, GIF `47 49 46`) fixed all 34 previously failing images.
 
 ---
 
-### Non-clothing item filtering in aggregation
+### Non-clothing item filtering
 
-**Decision:** Filter out non-clothing items before building the taste profile.
+**Decision:** Filter out non-clothing items (kitchen, electronics, tools) before building the taste profile.
 
-**Why:** 46 out of 122 orders were non-clothing. Without filtering, "accessory" and "plastic" dominated — skewing the fashion profile.
-
----
-
-## Phase 2
-
-### Dual-mode scripts (CLI + importable)
-
-**Decision:** All processing scripts (namer, pricer, images, publisher) work both as standalone CLI tools and as importable modules called by the Express server.
-
-**Why:** CLI mode allows testing and batch processing. Import mode lets the server call them on demand from the swipe UI. The `require.main === module` pattern (already used in db.js) provides this cleanly.
+**Why:** 46 out of 122 orders were non-clothing. Without filtering, "accessory" and "plastic" dominated the profile.
 
 ---
 
-### CJ Dropshipping API with token caching
+## Phase 2 — Sourcing & Curation
 
-**Decision:** Cache the CJ API access token to `.cj-token.json` with a 14-day TTL.
+### Turso cloud database (not local SQLite)
 
-**Why:** CJ only allows token requests once every 5 minutes. Caching avoids rate limits across multiple runs of `cj.js` and `monitor.js`.
+**Decision:** Migrate from better-sqlite3 to @libsql/client. Uses Turso cloud when `TURSO_DATABASE_URL` is set, falls back to local `file:data.db` for development.
 
----
-
-### Taste profile drives search keywords
-
-**Decision:** `cj.js` generates search queries by cross-joining top style tags with top garment types from the taste profile (e.g., "casual hoodie", "vintage jacket").
-
-**Why:** Instead of hardcoding search terms, the system automatically discovers products that match the brand's established aesthetic.
+**Why:** Railway's filesystem is ephemeral — local SQLite gets wiped on redeploy. Turso provides cloud-hosted SQLite with identical query semantics. One codebase, zero branching — just an env var switches between local and cloud.
 
 ---
 
-### 5-dimension weighted scoring
+### Headless Playwright with auto-detection
 
-**Decision:** Score candidates on 5 dimensions: aesthetic match (30%), color overlap (20%), silhouette match (20%), material match (15%), style tag overlap (15%).
+**Decision:** alistream.js auto-detects: tries CDP first (local Chrome), falls back to headless Playwright (cloud). `RAILWAY_ENVIRONMENT` or `HEADLESS` env var forces headless mode.
 
-**Why:** The taste profile has rich data on each dimension. Weighting aesthetic highest ensures brand coherence. The 7+ threshold keeps only strong matches in the swipe queue.
-
----
-
-### Image processing only post-swipe
-
-**Decision:** Run remove.bg and image normalization only on approved candidates, not all scored candidates.
-
-**Why:** remove.bg costs ~$0.15/image. Processing 500 candidates would cost $75+. Processing only the ~50-100 that pass the swipe saves significant cost.
+**Why:** CDP required a local Chrome window, making the system Mac-dependent. Headless Playwright with stealth settings (webdriver flag removed, real user agent, plugin spoofing) works on Railway 24/7 without any local browser.
 
 ---
 
-### Category-aware pricing with luxury multiplier
+### Multi-format image URL fallback
 
-**Decision:** Price is determined by category band (tee $28-48, hoodie $48-88, etc.), a 2.5x cost floor, and a Claude vision luxury score that interpolates within the band.
+**Decision:** Try multiple URL variations (.jpg, .webp, .png, strip .avif wrapper, strip size suffixes) before declaring "no usable image."
 
-**Why:** Different garment categories have different price expectations. The luxury score accounts for the visual quality gap between a $5 tee and a $15 tee — both have the same 2.5x floor, but one might retail at $28 and the other at $48.
-
----
-
-### Swipe UI as internal tool (not public)
-
-**Decision:** React + Vite app served by Express, designed as an internal curation tool with minimal polish.
-
-**Why:** This is a one-user workflow tool, not a customer-facing product. Clean but fast — Helvetica Neue, flat colors, keyboard shortcuts. No auth needed since it runs locally.
+**Why:** AliExpress CDN uses dynamic URL patterns. The scraper captures whatever the DOM shows (often a tiny avif thumbnail). Stripping to the base `.jpg` and trying alternatives recovers 80%+ of images.
 
 ---
 
-### Shopify Liquid theme as subdirectory
+### 3-layer junk filter pipeline (cheapest first)
 
-**Decision:** Store the Shopify theme in `theme/` within this project rather than a separate repo.
+**Decision:** Filter products in order: title keywords (free) → red banner pixel heuristic (free) → Claude vision yes/no (API cost). Only the vision check costs money.
 
-**Why:** Shares brand constants (colors, fonts) with the rest of the system. Deployed separately via `shopify theme push`. No build step needed — Liquid templates are consumed directly by Shopify.
+**Why:** AliExpress feeds contain sale banners, promotional graphics, and non-product images. Title keywords catch "sale", "% off", "discount" etc. instantly. The pixel heuristic catches red/white banner images without API calls. Claude vision only runs on products that passed both cheap filters — saving ~60% of API costs.
+
+---
+
+### Claude vision for gender detection
+
+**Decision:** Assign gender (mens/womens/unisex) using Claude vision on the product image during ingestion.
+
+**Why:** Product titles on AliExpress are unreliable. Vision analysis of cut, styling, and model presentation is far more accurate. Title keywords used as fast fallback for legacy data.
+
+---
+
+### 6 cycle strategies in alistream.js
+
+**Decision:** Rotate through: Homepage → Men's categories → Women's categories → Unisex search → Taste profile keywords → Accessories (jewelry/belts). 30-60s random delay between cycles.
+
+**Why:** Different pages surface different product types. Rotating ensures a diverse mix. Random delays prevent AliExpress from detecting a scraping pattern. The accessories cycle specifically targets jewelry and belts — high-margin categories.
+
+---
+
+### Railway: two services (web + worker)
+
+**Decision:** Deploy as two Railway services: `Dockerfile` (Express + React) and `Dockerfile.worker` (alistream.js with Playwright + Chromium).
+
+**Why:** Different lifecycle needs. Web server: always-on, health checks, serves UI. Worker: continuous scraping loop, high memory (Chromium), independent restarts. Both share the same Turso database.
 
 ---
 
@@ -108,84 +84,52 @@ Technical decisions and the reasoning behind them.
 
 **Decision:** The Edit Suite is a full-screen overlay launched from My Picks, not a permanent tab. Navigation stays SWIPE / MY PICKS / LIVE.
 
-**Why:** The edit flow is sequential (one product at a time, auto-advance on publish/skip) and needs full screen real estate for the photo editor + details. Making it a tab would waste space on the queue/skipped state management. The full-screen overlay pattern keeps the tab bar clean while giving the editor maximum viewport.
+**Why:** The edit flow is sequential (one product at a time, auto-advance on publish/skip) and needs full viewport for the photo editor. Making it a tab would waste space. The overlay pattern keeps tab bar clean while giving maximum editing real estate.
 
 ---
 
 ### Per-product publish (not bulk)
 
-**Decision:** Products publish individually from the Edit Suite via "Publish to Shopify" button, not in a bulk batch.
+**Decision:** Products publish individually from the Edit Suite, not in a bulk batch.
 
-**Why:** Each product needs editing before publishing — name, description, price, images. Bulk publish would skip this quality step. Per-product publish also means instant feedback ("Published!") and the ability to publish as you edit rather than batching everything.
-
----
-
-### Image enhancement as 6-step pipeline
-
-**Decision:** Auto-enhance applies: warm tone correction, gentle S-curve contrast, slight desaturation (13%), subtle sharpening, and 800x1000 crop with #F5F2ED padding. Uses Sharp.js, not external APIs.
-
-**Why:** Every AliExpress product image needs the same treatment to look like it was shot for IMMIGRANT's brand. The 6 steps approximate a brand photographer's post-processing: warm natural light feel, editorial contrast, muted palette. The before/after comparison lets the user override if the enhancement doesn't work for a specific image.
+**Why:** Each product needs editing — name, description, price, images — before publishing. Per-product publish gives instant feedback and lets you publish as you edit.
 
 ---
 
-### Separate scripts, not a monolith
+### Image enhancement: 6-step Sharp.js pipeline
 
-**Decision:** Each capability is its own standalone script, connected by SQLite and the Express server.
+**Decision:** Auto-enhance applies: warm tone correction → gentle contrast → 13% desaturation → subtle sharpening → 800x1000 crop with #F5F2ED padding. Before/after comparison with undo.
 
-**Why:** Each step has different runtime needs (browser for scraping, API keys for analysis, Shopify for publishing). Independent scripts mean you can re-run just the scoring, or re-price without re-naming. The server orchestrates them on demand.
-
----
-
-### Claude vision for gender detection (not title-only)
-
-**Decision:** Assign gender (mens/womens/unisex) using Claude vision on the product image, with a title-keyword fallback for existing candidates.
-
-**Why:** Product titles on AliExpress are unreliable — "unisex" items often show a clearly gendered presentation, and many titles don't mention gender at all. Vision analysis of the actual product image (cut, styling, model) is far more accurate. Title keywords are used as a fast first pass for legacy data.
+**Why:** Every AliExpress product image needs the same treatment to match IMMIGRANT's brand. The 6 steps approximate brand photography post-processing: warm natural light, editorial contrast, muted palette. No external API needed — Sharp.js handles everything locally.
 
 ---
 
-### Gender filter in swipe UI (not separate queues)
+### 18 Shopify collections with auto-assignment
 
-**Decision:** Single swipe queue with filter buttons (ALL / M / W / U) rather than separate queues per gender.
+**Decision:** Auto-create 18 collections: New In, Men/Women-Tops/Bottoms/Outerwear/Footwear, Mens/Womens/Unisex-Jewelry/Belts, Unisex, Accessories, Archive. Products assigned on publish based on gender + category.
 
-**Why:** The user curates in sessions — sometimes all genders, sometimes focused on one. Filter buttons let them switch instantly without losing batch state. The gender badge is tappable to cycle (mens → womens → unisex) in case Claude got it wrong, so corrections are instant.
-
----
-
-### Shopify collections by gender + category (18 collections)
-
-**Decision:** Auto-create 18 Shopify collections including gender-specific jewelry and belt collections (Mens-Jewelry, Womens-Jewelry, Unisex-Jewelry, Mens-Belts, Womens-Belts, Unisex-Belts) in addition to clothing categories.
-
-**Why:** Jewelry and belts are high-margin accessory categories that warrant their own collections in the store navigation. Gender-specific collections (not just "Accessories") let customers browse "Women's Jewelry" or "Men's Belts" directly — matching the Farfetch navigation pattern. The namer.js prompt now detects product category (jewelry/belts/tops/etc.) and the publisher routes to the correct collection automatically.
+**Why:** Farfetch-style navigation needs structured collections. Auto-assignment means the user never manually sorts products. Category from namer.js, gender from vision classifier.
 
 ---
 
-### Turso cloud database (not self-hosted SQLite)
+### Image URL fallback in React (imgUrl.js helper)
 
-**Decision:** Migrate from better-sqlite3 (local file) to @libsql/client supporting both local SQLite and Turso cloud, selected by the `TURSO_DATABASE_URL` env var.
+**Decision:** All React components use a shared `imgUrl(item)` helper that tries local path first, then falls back to AliExpress CDN URL with .avif stripping.
 
-**Why:** Running on Railway means the filesystem is ephemeral — a local SQLite file would be wiped on redeploy. Turso provides cloud-hosted SQLite with the same query semantics. The @libsql/client works with both `file:data.db` (local dev) and `libsql://...turso.io` (production), so no code branching needed.
-
----
-
-### Headless Playwright with auto-detection (not CDP-only)
-
-**Decision:** alistream.js auto-detects the environment: tries CDP first (local), falls back to headless Playwright (cloud). Railway/HEADLESS env var forces headless mode.
-
-**Why:** CDP required a local Chrome window, making the system Mac-dependent. Headless Playwright with stealth settings (webdriver flag removed, real user agent, plugin spoofing) works on Railway without any local browser. AliExpress may still challenge headless bots, but for product page scraping (not login-gated pages), headless works well enough.
+**Why:** On Railway, image files don't exist locally (they were downloaded to the Mac). The CDN fallback means images display correctly on both local dev and cloud deployment without any file syncing.
 
 ---
 
-### Multi-format image URL fallback
+### Brand voice description prompt (exact)
 
-**Decision:** Try multiple URL variations for each AliExpress image (strip .avif, strip size suffixes, try .jpg/.webp/.png) before declaring "no usable image."
+**Decision:** Fixed Claude prompt for product descriptions: "1-3 sentences, describe only the garment, focus on fabric weight/fit/construction, no marketing language, sounds like Celine/Acne Studios/A.P.C."
 
-**Why:** AliExpress serves images through a CDN that uses dynamic URL patterns — the same image might work at `.jpg`, `_480x480q75.jpg_.avif`, or `.webp`. The scraper captures whatever URL the DOM shows, which is often a tiny avif thumbnail. Stripping to the base `.jpg` and trying alternatives recovers 80%+ of images that would otherwise fail.
+**Why:** Consistent brand voice across all products. The prompt with examples ("Heavyweight cotton. Dropped shoulders. Washed once.") produces descriptions that match luxury minimalist copy. Editable in Edit Suite if the output needs tweaking.
 
 ---
 
-### Railway: two services (web + worker)
+### DSers for fulfillment (not custom integration)
 
-**Decision:** Deploy as two Railway services from the same repo — `Dockerfile` for the web server, `Dockerfile.worker` for the alistream worker.
+**Decision:** Use DSers Shopify app for AliExpress order fulfillment instead of building a custom fulfillment system.
 
-**Why:** The web server (Express + React) and the product stream (alistream.js) have different lifecycle needs. The web server should be always-on, respond to health checks, and serve the swipe UI. The worker runs a continuous loop with 30-60s pauses, consuming more memory (Playwright + Chromium). Separate services means they scale and restart independently.
+**Why:** DSers handles the order → AliExpress → tracking pipeline reliably. Building this ourselves would duplicate existing infrastructure. DSers is free for up to 3 stores and integrates directly with Shopify.
