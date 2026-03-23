@@ -386,48 +386,47 @@ app.listen(PORT, () => {
   console.log(`[startup] RAILWAY_ENVIRONMENT: ${process.env.RAILWAY_ENVIRONMENT || 'not set'}`);
 });
 
-// Connect DB async — server is already responding to healthchecks
-(async () => {
+// Connect DB async with retry — server is already responding to healthchecks
+async function connectDb(attempt = 1) {
+  const MAX_RETRIES = 3;
   try {
-    console.log(`[db-init] Requiring ./db...`);
-    const { getDb, initSchema, queryAll, queryOne } = require("./db");
+    console.log(`[db-init] Attempt ${attempt}/${MAX_RETRIES}`);
 
-    console.log(`[db-init] Calling getDb()...`);
+    const { getDb, initSchema } = require("./db");
     db = getDb();
-
-    console.log(`[db-init] Calling initSchema()...`);
     await initSchema(db);
 
-    // Direct count query with full logging
-    console.log(`[db-init] Running: SELECT COUNT(*) as c FROM candidates`);
-    const countResult = await db.execute("SELECT COUNT(*) as c FROM candidates");
-    console.log(`[db-init] Raw count result: ${JSON.stringify(countResult)}`);
-    console.log(`[db-init] countResult.rows: ${JSON.stringify(countResult.rows)}`);
-    console.log(`[db-init] countResult.rows[0]: ${JSON.stringify(countResult.rows[0])}`);
+    // Verify with simplest possible query
+    console.log(`[db-init] Running: SELECT 1 as test`);
+    const pingResult = await db.execute("SELECT 1 as test");
+    console.log(`[db-init] Ping result: ${JSON.stringify(pingResult.rows)}`);
 
-    // Also try via queryOne helper
-    const countViaHelper = await queryOne(db, "SELECT COUNT(*) as c FROM candidates");
-    console.log(`[db-init] Via queryOne: ${JSON.stringify(countViaHelper)}`);
+    // Count candidates
+    const countResult = await db.execute("SELECT COUNT(*) as c FROM candidates");
+    console.log(`[db-init] Candidates: ${countResult.rows[0]?.c || 0}`);
 
     // Status breakdown
-    console.log(`[db-init] Running: SELECT status, COUNT(*) as c FROM candidates GROUP BY status`);
     const statusResult = await db.execute("SELECT status, COUNT(*) as c FROM candidates GROUP BY status");
-    console.log(`[db-init] Status raw rows: ${JSON.stringify(statusResult.rows)}`);
-
-    // Sample a row to verify data is there
-    console.log(`[db-init] Running: SELECT id, title, status FROM candidates LIMIT 1`);
-    const sampleResult = await db.execute("SELECT id, title, status FROM candidates LIMIT 1");
-    console.log(`[db-init] Sample row: ${JSON.stringify(sampleResult.rows[0])}`);
-
-    // Check tables exist
-    const tablesResult = await db.execute("SELECT name FROM sqlite_master WHERE type='table'");
-    console.log(`[db-init] Tables: ${tablesResult.rows.map(r => r.name).join(', ')}`);
+    console.log(`[db-init] Statuses: ${JSON.stringify(statusResult.rows)}`);
 
     dbReady = true;
+    dbError = null;
     console.log(`[db-init] SUCCESS — dbReady=true`);
   } catch (err) {
-    dbError = err.message;
-    console.error(`[db-init] FAILED: ${err.message}`);
+    console.error(`[db-init] Attempt ${attempt} FAILED: ${err.message}`);
+    console.error(`[db-init] Error code: ${err.code || 'none'}`);
     console.error(`[db-init] Stack: ${err.stack}`);
+
+    if (attempt < MAX_RETRIES) {
+      const delay = attempt * 3000;
+      console.log(`[db-init] Retrying in ${delay / 1000}s...`);
+      await new Promise(r => setTimeout(r, delay));
+      return connectDb(attempt + 1);
+    }
+
+    dbError = err.message;
+    console.error(`[db-init] All ${MAX_RETRIES} attempts failed. DB not available.`);
   }
-})();
+}
+
+connectDb();

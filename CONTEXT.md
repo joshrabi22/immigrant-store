@@ -81,13 +81,21 @@ Phase 1 (taste profiling) and Phase 2 (sourcing, curation, publishing) are compl
 - Image URLs: local path on dev, AliExpress CDN fallback on cloud (via `imgUrl.js` helper)
 - Mobile-optimized: PWA viewport, safe-area insets, large touch targets
 
+**Turso compatibility fixes (2026-03-24):**
+- Removed all PRAGMA statements from db.js (Turso HTTP returns 400)
+- Removed `datetime('now')` defaults (not supported over Turso wire protocol)
+- Removed ALTER TABLE column migrations — all columns defined upfront in CREATE TABLE
+- Added early-exit: if tables exist, skip schema creation entirely
+- `better-sqlite3`, `sharp`, `playwright` moved to optionalDependencies (native modules crash Railway builds)
+- Server starts BEFORE database connects — healthcheck `/api/stats` returns 200 with zeros while DB initializes
+- `/api/health` endpoint for debugging — always returns 200 with `dbReady` status
+
 ### Known issues
-- DNS for curate.22immigrant.com still propagating — test on Railway URL tomorrow
-- Need to verify full swipe → edit → publish flow on Railway
-- Image enhancement (Sharp.js) may need platform-specific binary on Railway
+- Sharp.js not available on Railway (native binary) — image enhancement disabled on cloud, works locally
+- Image files are local-only — Railway serves images via AliExpress CDN URLs (imgUrl.js fallback)
 
 ### What's next
-- Test full flow end-to-end on Railway deployment
+- Test full swipe → edit → publish flow on Railway
 - Instagram content automation (Phase 3/4)
 - Shopify theme deployment via `shopify theme push`
 

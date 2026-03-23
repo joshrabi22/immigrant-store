@@ -32,6 +32,30 @@ Technical decisions and the reasoning behind them.
 
 ---
 
+### Turso HTTP compatibility: no PRAGMA, no datetime(), skip-if-exists
+
+**Decision:** Schema initialization checks if tables exist first (`SELECT COUNT(*) FROM candidates`). If they do, skip all CREATE/ALTER statements entirely. No PRAGMA, no `datetime('now')` defaults, no `executeMultiple`. All columns defined upfront in CREATE TABLE.
+
+**Why:** Turso's HTTP wire protocol is stricter than SQLite — it rejects PRAGMA statements with HTTP 400, doesn't support `executeMultiple`, and has issues with `datetime('now')` in DEFAULT clauses. Since the tables already exist (created during migration), the simplest fix is to not run schema creation at all. Fresh databases get the full CREATE TABLE with all columns; existing databases skip straight to verification.
+
+---
+
+### Server starts before database (crash-proof startup)
+
+**Decision:** Express server starts listening immediately on PORT. Database connects asynchronously in the background. `/api/stats` and `/api/health` return 200 with zeros while DB initializes. All other endpoints return 503 until `dbReady=true`.
+
+**Why:** Railway kills services that fail the healthcheck within 30 seconds. If database connection is slow or fails, the server was never starting and Railway kept restarting it in a loop. Starting the HTTP server first means the healthcheck passes immediately, then the DB connects in the background.
+
+---
+
+### Native modules as optionalDependencies
+
+**Decision:** Moved `better-sqlite3`, `sharp`, and `playwright` to `optionalDependencies` in package.json. Only `@libsql/client`, `express`, `cors`, `dotenv`, and `@anthropic-ai/sdk` are hard dependencies.
+
+**Why:** Native C++ modules (better-sqlite3, sharp) fail to compile on Railway's Docker build environment. Playwright pulls a full Chromium browser (~300MB) that the web server doesn't need. Making them optional means `npm install` succeeds even if they can't build, and the server starts without them. Endpoints that need sharp/playwright gracefully return errors.
+
+---
+
 ### Headless Playwright with auto-detection
 
 **Decision:** alistream.js auto-detects: tries CDP first (local Chrome), falls back to headless Playwright (cloud). `RAILWAY_ENVIRONMENT` or `HEADLESS` env var forces headless mode.

@@ -128,12 +128,28 @@ Sparse. Declarative. Present tense. No marketing language.
 
 | Service | Platform | Status |
 |---------|----------|--------|
-| Web app (server.js + React) | Railway | Deployed |
+| Web app (server.js + React) | Railway | Deployed — crash-proof startup |
 | Worker (alistream.js) | Railway | Deployed |
 | Database | Turso | 665 candidates migrated |
 | Storefront | Shopify | 22immigrant.myshopify.com |
-| Curation domain | curate.22immigrant.com | DNS propagating |
-| Fulfillment | DSers | Installed |
+| Curation domain | curate.22immigrant.com | DNS configured |
+| Fulfillment | DSers | Installed + linked |
+
+## Railway Architecture Notes
+
+- Server starts HTTP listener immediately, connects to Turso async in background
+- `/api/health` and `/api/stats` return 200 before DB is ready (zeros) — passes healthcheck
+- All other endpoints return 503 until `dbReady=true`
+- Native modules (better-sqlite3, sharp, playwright) in optionalDependencies — won't crash `npm install`
+- Schema init skips CREATE TABLE if tables already exist — avoids Turso HTTP 400 on PRAGMA/datetime
+- Images served from AliExpress CDN on Railway (no local files) via `imgUrl.js` client helper
+- Verbose startup logs show: env vars, DB connection, candidate count, status breakdown
+
+## Known Limitations
+
+- **Sharp.js** not available on Railway — image enhancement (auto-enhance, crop) disabled on cloud. Works locally.
+- **Image files** are local-only — Railway serves product images from AliExpress CDN URLs instead of processed local files
+- **Playwright** on Railway worker may hit AliExpress bot detection — headless mode with stealth settings, but not guaranteed
 
 ## What's Next
 
@@ -141,3 +157,4 @@ Sparse. Declarative. Present tense. No marketing language.
 2. **Instagram content automation** — product photography, captions, scheduling
 3. **Shopify theme deployment** — `shopify theme push` the Liquid theme
 4. **Monitoring** — dead listing checks, alistream health
+5. **Image CDN** — consider Cloudinary or S3 for processed images (removes local file dependency)

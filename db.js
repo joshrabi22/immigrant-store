@@ -16,11 +16,16 @@ function getDb() {
   if (_client) return _client;
 
   if (IS_TURSO) {
-    _client = createClient({
-      url: process.env.TURSO_DATABASE_URL,
-      authToken: process.env.TURSO_AUTH_TOKEN,
-    });
-    console.log(`[db] Connected to Turso cloud: ${process.env.TURSO_DATABASE_URL}`);
+    // Sanitize env vars — strip whitespace/newlines that Railway might add
+    const url = process.env.TURSO_DATABASE_URL.trim();
+    const authToken = process.env.TURSO_AUTH_TOKEN.trim();
+
+    console.log(`[db] Turso URL: "${url}"`);
+    console.log(`[db] Turso URL protocol: ${url.split("://")[0]}`);
+    console.log(`[db] Turso token length: ${authToken.length}`);
+
+    _client = createClient({ url, authToken });
+    console.log(`[db] Connected to Turso cloud`);
   } else {
     _client = createClient({ url: `file:${DB_PATH}` });
     console.log(`[db] Using local SQLite: ${DB_PATH}`);
