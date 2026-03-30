@@ -1,431 +1,1757 @@
-// server.js — Express API server for IMMIGRANT curation tool
+// server.js — IMMIGRANT canonical API server
 // Usage: node server.js
+//
+// Implements the canonical state model:
+//   stage:             intake → staged → approved → launch_ready → published | removed
+//   processing_status: null → pending → processing → ready | failed
+//   review_status:     null → accepted | revision_needed | discarded
+//
+// Every mutation validates current state via WHERE clause, updates atomically,
+// and logs to item_events only after confirmed state change.
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const { getDb, queryAll, queryOne, run } = require("./db");
+const { enqueueProcessingJob } = require("./server/lib/processingQueue");
+const { processCandidate } = require("./server/workers/ghostLogicWorker");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const IS_CLOUD = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.TURSO_DATABASE_URL;
 
 app.use(cors());
 app.use(express.json());
 app.use("/images", express.static(path.join(__dirname, "images")));
 app.use(express.static(path.join(__dirname, "client", "dist")));
 
-// Database — initialized async, endpoints wait for it
 let db = null;
 let dbReady = false;
 let dbError = null;
 
-const DESC_PROMPT = `Write a product description for IMMIGRANT, a minimal luxury streetwear brand.
-Rules:
-- 1 to 3 sentences maximum
-- Describe only what the garment physically is
-- Focus on: fabric weight, fit, construction details, how it falls or moves
-- No marketing language
-- No adjectives that mean nothing (luxury, premium, high quality, perfect)
-- No exclamation marks
-- Present tense, declarative
-- Sounds like Celine, Acne Studios, or A.P.C. product copy
-Return only the description, nothing else.`;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-// Lazy imports for heavy modules
-function getAnthropic() { return new (require("@anthropic-ai/sdk"))(); }
-function getModel() { return process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514"; }
+function now() {
+  return new Date().toISOString();
+}
 
-// Middleware: wait for DB or return error
+// Append an audit event. Called only after a confirmed state change.
+async function logEvent(candidateId, eventType, fromStage, toStage, metadata) {
+  await run(db,
+    "INSERT INTO item_events (candidate_id, event_type, from_stage, to_stage, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [candidateId, eventType, fromStage || null, toStage || null, metadata ? JSON.stringify(metadata) : null, now()]
+  );
+}
+
+// After a guarded UPDATE returns 0 rows affected, determine why.
+// Returns a response-ready object: { status: 404|409, body: {...} }
+async function diagnoseMutationFailure(id, expectedStage) {
+  const item = await queryOne(db, "SELECT id, stage FROM candidates WHERE id = ?", [id]);
+  if (!item) {
+    return { status: 404, body: { error: "Item not found" } };
+  }
+  return {
+    status: 409,
+    body: {
+      error: `Expected stage '${expectedStage}', found '${item.stage}'`,
+      current_stage: item.stage,
+    },
+  };
+}
+
+// Middleware: require DB to be connected
 function requireDb(req, res, next) {
   if (dbReady && db) return next();
-  if (dbError) return res.status(503).json({ error: `Database not available: ${dbError}` });
-  return res.status(503).json({ error: "Database initializing, try again in a moment" });
+  if (dbError) return res.status(503).json({ error: `Database unavailable: ${dbError}` });
+  return res.status(503).json({ error: "Database initializing" });
 }
 
 // ---------------------------------------------------------------------------
-// HEALTH CHECK — works immediately, no DB required
+// HEALTH — always responds, no DB required
 // ---------------------------------------------------------------------------
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, dbReady, dbError: dbError || null, timestamp: new Date().toISOString() });
+  res.json({ ok: true, dbReady, dbError: dbError || null, timestamp: now() });
 });
 
 // ---------------------------------------------------------------------------
-// STATS — returns zeros if DB not ready (so healthcheck passes)
+// COUNTS — single endpoint for all sidebar badges
 // ---------------------------------------------------------------------------
+//
+// Canonical visibility rules:
+//
+//   suggested:          source='suggested' AND stage='intake'
+//   watched:            source='watched' AND stage='intake'
+//   previously_ordered: source='past_order' AND stage='intake'
+//   staging:            stage='staged'
+//                       AND NOT (COALESCE(processing_status,'none') IN ('pending','processing') AND processing_started_at IS NOT NULL)
+//                       AND NOT (COALESCE(processing_status,'none')='ready' AND review_status IS NULL)
+//   processing:         stage='staged' AND processing_status IN ('pending','processing','failed')
+//   photo_suite:        stage='staged' AND processing_status='ready' AND review_status IS NULL
+//   approved:           stage='approved'
+//   launch:             stage='launch_ready'
+//   live:               stage='published'
 
-app.get("/api/stats", async (req, res) => {
-  console.log(`[api/stats] called — dbReady=${dbReady} db=${!!db} dbError=${dbError}`);
-  if (!dbReady || !db) {
-    console.log(`[api/stats] DB not ready, returning zeros`);
-    return res.json({ total: 0, unswiped: 0, approved: 0, skipped: 0, published: 0, dbReady: false, dbError: dbError || null });
-  }
+app.get("/api/counts", requireDb, async (req, res) => {
   try {
-    const { queryOne } = require("./db");
-    console.log(`[api/stats] Querying total...`);
-    const total = await queryOne(db, "SELECT COUNT(*) as c FROM candidates");
-    console.log(`[api/stats] total raw: ${JSON.stringify(total)}`);
-    const unswiped = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND id NOT IN (SELECT candidate_id FROM swipe_decisions)");
-    const approved = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status IN ('approved', 'editing')");
-    const skipped = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'skipped'");
-    const published = await queryOne(db, "SELECT COUNT(*) as c FROM candidates WHERE status = 'published'");
-    const stats = {
-      total: total?.c || 0, unswiped: unswiped?.c || 0,
-      approved: approved?.c || 0, skipped: skipped?.c || 0, published: published?.c || 0,
-    };
-    console.log(`[api/stats] returning: ${JSON.stringify(stats)}`);
-    res.json(stats);
-  } catch (err) {
-    console.error(`[api/stats] ERROR: ${err.message}`);
-    console.error(`[api/stats] Stack: ${err.stack}`);
-    res.json({ total: 0, unswiped: 0, approved: 0, skipped: 0, published: 0, error: err.message });
-  }
-});
+    const counts = {};
 
-// ---------------------------------------------------------------------------
-// All other API routes require DB
-// ---------------------------------------------------------------------------
+    // Intake feeds — one grouped query
+    const intakeCounts = await queryAll(db,
+      "SELECT source, COUNT(*) as c FROM candidates WHERE stage = 'intake' GROUP BY source"
+    );
+    const intakeMap = {};
+    for (const row of intakeCounts) intakeMap[row.source] = row.c;
+    counts.suggested = intakeMap["suggested"] || 0;
+    counts.watched = intakeMap["watched"] || 0;
+    counts.previously_ordered = intakeMap["past_order"] || 0;
+    counts.reverse_image = intakeMap["reverse_image"] || 0;
+    counts.wishlist = intakeMap["wishlist"] || 0;
 
-app.use("/api", requireDb);
-
-// ---------------------------------------------------------------------------
-// SWIPE
-// ---------------------------------------------------------------------------
-
-app.get("/api/swipe/batch", async (req, res) => {
-  try {
-    const { queryAll, queryOne } = require("./db");
-    const gf = req.query.gender;
-    const gc = gf ? `AND c.gender = '${gf}'` : "";
-    const candidates = await queryAll(db, `
-      SELECT c.* FROM candidates c WHERE c.status = 'new'
-      AND (c.image_path IS NOT NULL OR c.image_url IS NOT NULL)
-      AND c.id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}
-      ORDER BY c.created_at DESC LIMIT 100
+    // Staging: staged items excluding those in processing queue or awaiting first review.
+    // review_status is canonically nullable (NULL = not yet reviewed).
+    // We check IS NULL only; empty string should not occur in canonical data,
+    // but the migration may have left some rows with empty string if the column
+    // was added with a default. This is acceptable — those items would appear
+    // in Staging (safe side) rather than Photo Suite.
+    // Staging count: excludes items actively in processing (have processing_started_at)
+    // and items awaiting Photo Suite review. Stale-pending items (no processing_started_at)
+    // count as Staging since they were never actually submitted for processing.
+    const stagingResult = await queryOne(db, `
+      SELECT COUNT(*) as c FROM candidates
+      WHERE stage = 'staged'
+      AND NOT (COALESCE(processing_status, 'none') IN ('pending', 'processing') AND processing_started_at IS NOT NULL)
+      AND NOT (COALESCE(processing_status, 'none') = 'ready' AND review_status IS NULL)
     `);
-    const filtered = IS_CLOUD ? candidates : candidates.filter((c) => {
-      if (!c.image_path) return !!c.image_url;
-      try { return fs.statSync(path.join(__dirname, c.image_path)).size >= 5000; } catch (_) { return !!c.image_url; }
+    counts.staging = stagingResult?.c || 0;
+
+    // Processing (stale-pending guard: require processing_started_at for pending/processing)
+    const processingResult = await queryOne(db,
+      `SELECT COUNT(*) as c FROM candidates WHERE stage = 'staged' AND (
+        (processing_status IN ('pending', 'processing') AND processing_started_at IS NOT NULL)
+        OR processing_status = 'failed'
+      )`
+    );
+    counts.processing = processingResult?.c || 0;
+
+    // Photo Suite: only ready items that have NOT been reviewed
+    const photoSuiteResult = await queryOne(db,
+      "SELECT COUNT(*) as c FROM candidates WHERE stage = 'staged' AND processing_status = 'ready' AND review_status IS NULL"
+    );
+    counts.photo_suite = photoSuiteResult?.c || 0;
+
+    // Approved
+    const approvedResult = await queryOne(db,
+      "SELECT COUNT(*) as c FROM candidates WHERE stage = 'approved'"
+    );
+    counts.approved = approvedResult?.c || 0;
+
+    // Launch
+    const launchResult = await queryOne(db,
+      "SELECT COUNT(*) as c FROM candidates WHERE stage = 'launch_ready'"
+    );
+    counts.launch = launchResult?.c || 0;
+
+    // Live
+    const liveResult = await queryOne(db,
+      "SELECT COUNT(*) as c FROM candidates WHERE stage = 'published'"
+    );
+    counts.live = liveResult?.c || 0;
+
+    res.json(counts);
+  } catch (err) {
+    console.error("[api/counts]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// INTAKE — source feeds
+// ---------------------------------------------------------------------------
+
+// GET /api/intake/:source
+app.get("/api/intake/:source", requireDb, async (req, res) => {
+  try {
+    const validSources = ["suggested", "watched", "past_order", "reverse_image", "wishlist"];
+    const source = req.params.source;
+
+    if (!validSources.includes(source)) {
+      return res.status(400).json({ error: `Invalid source. Expected one of: ${validSources.join(", ")}` });
+    }
+
+    const items = await queryAll(db,
+      "SELECT * FROM candidates WHERE source = ? AND stage = 'intake' ORDER BY created_at DESC",
+      [source]
+    );
+
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/intake]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/intake/:id/approve — transition T1: intake → staged
+//
+// The UPDATE itself is the guard: WHERE id = ? AND stage = 'intake'.
+// If rowsAffected = 0, we diagnose whether the item is missing or in the wrong stage.
+// item_events is appended only after a confirmed transition.
+app.post("/api/intake/:id/approve", requireDb, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'staged', processing_status = NULL, staged_at = ?, updated_at = ? WHERE id = ? AND stage = 'intake'",
+      [timestamp, timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "intake");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "intake_approved", "intake", "staged", null);
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/intake/approve]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/intake/:id/reject — transition T2: intake → removed
+app.post("/api/intake/:id/reject", requireDb, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'removed', updated_at = ? WHERE id = ? AND stage = 'intake'",
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "intake");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "intake_rejected", "intake", "removed", null);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/intake/reject]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// STAGING
+// ---------------------------------------------------------------------------
+
+// Canonical Staging visibility rule as a SQL fragment.
+// Staging shows staged items EXCEPT those actively in the processing queue
+// AND EXCEPT those awaiting first Photo Suite review.
+// Stale-pending guard: only exclude pending/processing items that were actually
+// submitted (have processing_started_at). Legacy items with the column default
+// of 'pending' but no started_at appear in Staging, not Processing.
+const STAGING_VISIBILITY = `
+  stage = 'staged'
+  AND NOT (COALESCE(processing_status, 'none') IN ('pending', 'processing') AND processing_started_at IS NOT NULL)
+`;
+
+const VALID_GENDERS = ["mens", "womens", "unisex"];
+const VALID_CATEGORIES = ["tops", "bottoms", "outerwear", "footwear", "jewelry", "belts", "accessories"];
+
+// Helper: validate id param. Returns parsed int or sends 400 and returns null.
+function parseId(req, res) {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ error: "Invalid id" });
+    return null;
+  }
+  return id;
+}
+
+// Helper: fetch item and verify it is visible in Staging.
+// Returns the item, or sends an error response and returns null.
+async function requireStagingItem(res, id) {
+  const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+  if (!item) {
+    res.status(404).json({ error: "Item not found" });
+    return null;
+  }
+  // Check canonical Staging visibility
+  if (item.stage !== "staged") {
+    res.status(409).json({
+      error: `Item is not in Staging (stage='${item.stage}')`,
+      current_stage: item.stage,
     });
-    const count = await queryOne(db, `SELECT COUNT(*) as c FROM candidates WHERE status = 'new' AND (image_path IS NOT NULL OR image_url IS NOT NULL) AND id NOT IN (SELECT candidate_id FROM swipe_decisions) ${gc}`);
-    res.json({ candidates: filtered, total_remaining: count?.c || 0 });
-  } catch (err) { console.error(`[swipe/batch] ${err.message}`); res.status(500).json({ error: err.message }); }
+    return null;
+  }
+  const inProcessingQueue = item.processing_status === "pending" || item.processing_status === "processing";
+  if (inProcessingQueue) {
+    res.status(409).json({
+      error: `Item is staged but currently in the processing queue (processing_status='${item.processing_status}')`,
+      current_stage: item.stage,
+      processing_status: item.processing_status,
+      review_status: item.review_status,
+    });
+    return null;
+  }
+  return item;
+}
+
+// GET /api/staging — items visible in the Staging workbench
+app.get("/api/staging", requireDb, async (req, res) => {
+  try {
+    const items = await queryAll(db, `
+      SELECT * FROM candidates
+      WHERE ${STAGING_VISIBILITY}
+      ORDER BY
+        CASE WHEN review_status = 'revision_needed' THEN 0 ELSE 1 END,
+        COALESCE(staged_at, created_at) DESC
+    `);
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/staging]", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/swipe/decide", async (req, res) => {
+// GET /api/staging/:id — single Staging item for Deep Edit
+app.get("/api/staging/:id", requireDb, async (req, res) => {
   try {
-    const { run } = require("./db");
-    const { candidate_id, decision } = req.body;
-    if (!candidate_id || !["approve", "reject"].includes(decision)) return res.status(400).json({ error: "invalid" });
-    await run(db, "INSERT INTO swipe_decisions (candidate_id, decision) VALUES (?, ?)", [candidate_id, decision]);
-    await run(db, "UPDATE candidates SET status = ? WHERE id = ?", [decision === "approve" ? "approved" : "rejected", candidate_id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    const id = parseId(req, res);
+    if (id === null) return;
 
-app.post("/api/swipe/undo", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const last = await queryOne(db, "SELECT id, candidate_id FROM swipe_decisions ORDER BY id DESC LIMIT 1");
-    if (!last) return res.status(400).json({ error: "Nothing to undo" });
-    await run(db, "DELETE FROM swipe_decisions WHERE id = ?", [last.id]);
-    await run(db, "UPDATE candidates SET status = 'new' WHERE id = ?", [last.candidate_id]);
-    const restored = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [last.candidate_id]);
-    res.json({ ok: true, restored });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    const item = await requireStagingItem(res, id);
+    if (!item) return;
 
-// ---------------------------------------------------------------------------
-// PICKS
-// ---------------------------------------------------------------------------
-
-app.get("/api/picks", async (req, res) => {
-  try {
-    const { queryAll } = require("./db");
-    const picks = await queryAll(db, "SELECT * FROM candidates WHERE status IN ('approved', 'editing', 'skipped') ORDER BY status ASC, created_at DESC");
-    res.json({ picks });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.delete("/api/picks/:id", async (req, res) => {
-  try {
-    const { run } = require("./db");
-    await run(db, "UPDATE candidates SET status = 'removed' WHERE id = ?", [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ---------------------------------------------------------------------------
-// EDIT SUITE
-// ---------------------------------------------------------------------------
-
-app.get("/api/edit/queue", async (req, res) => {
-  try {
-    const { queryAll } = require("./db");
-    res.json({ items: await queryAll(db, "SELECT * FROM candidates WHERE status IN ('approved', 'editing') ORDER BY created_at DESC") });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/edit/skipped", async (req, res) => {
-  try {
-    const { queryAll } = require("./db");
-    res.json({ items: await queryAll(db, "SELECT * FROM candidates WHERE status = 'skipped' ORDER BY created_at DESC") });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get("/api/edit/:id", async (req, res) => {
-  try {
-    const { queryOne } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (!item) return res.status(404).json({ error: "Not found" });
     res.json(item);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error("[api/staging/:id]", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post("/api/edit/:id/save", async (req, res) => {
+// PUT /api/staging/:id/gallery — update curated image gallery
+//
+// Mutation-guarded: UPDATE includes STAGING_VISIBILITY in WHERE clause.
+// Pre-read is used only to capture before-count for the event log.
+app.put("/api/staging/:id/gallery", requireDb, async (req, res) => {
   try {
-    const { run, queryOne } = require("./db");
-    const { edited_name, edited_description, edited_price, gender, detected_category, edited_colors, edited_sizes } = req.body;
-    const sets = [];
-    const params = [];
-    if (edited_name !== undefined) { sets.push("edited_name = ?"); params.push(edited_name); }
-    if (edited_description !== undefined) { sets.push("edited_description = ?"); params.push(edited_description); }
-    if (edited_price !== undefined) { sets.push("edited_price = ?"); params.push(edited_price); }
-    if (gender !== undefined) { sets.push("gender = ?"); params.push(gender); }
-    if (detected_category !== undefined) { sets.push("detected_category = ?"); params.push(detected_category); }
-    if (edited_colors !== undefined) { sets.push("edited_colors = ?"); params.push(JSON.stringify(edited_colors)); }
-    if (edited_sizes !== undefined) { sets.push("edited_sizes = ?"); params.push(JSON.stringify(edited_sizes)); }
-    sets.push("status = 'editing'");
-    params.push(req.params.id);
-    await run(db, `UPDATE candidates SET ${sets.join(", ")} WHERE id = ?`, params);
-    res.json(await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    const id = parseId(req, res);
+    if (id === null) return;
 
-app.post("/api/edit/:id/skip", async (req, res) => {
-  try { const { run } = require("./db"); await run(db, "UPDATE candidates SET status = 'skipped' WHERE id = ?", [req.params.id]); res.json({ ok: true }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/edit/:id/unskip", async (req, res) => {
-  try { const { run } = require("./db"); await run(db, "UPDATE candidates SET status = 'editing' WHERE id = ?", [req.params.id]); res.json({ ok: true }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/edit/:id/generate-name", async (req, res) => {
-  try { const { nameCandidate } = require("./namer"); res.json(await nameCandidate(parseInt(req.params.id), db)); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/edit/:id/generate-description", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (!item) return res.status(404).json({ error: "Not found" });
-    const name = item.edited_name || item.immigrant_name || item.title;
-    const client = getAnthropic();
-    const response = await client.messages.create({
-      model: getModel(), max_tokens: 256,
-      messages: [{ role: "user", content: `Product: ${name}\n\n${DESC_PROMPT}` }],
-    });
-    const description = response.content[0].text.trim();
-    await run(db, "UPDATE candidates SET edited_description = ? WHERE id = ?", [description, req.params.id]);
-    res.json({ description });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/edit/:id/remove-bg", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (!item?.image_path) return res.status(400).json({ error: "No image" });
-    const apiKey = process.env.REMOVEBG_API_KEY;
-    if (!apiKey) return res.status(400).json({ error: "REMOVEBG_API_KEY not set" });
-    const fullPath = path.resolve(__dirname, item.image_path);
-    const imageData = fs.readFileSync(fullPath);
-    if (!item.original_image_path) {
-      const backupPath = item.image_path.replace(/(\.\w+)$/, "_original$1");
-      fs.copyFileSync(fullPath, path.resolve(__dirname, backupPath));
-      await run(db, "UPDATE candidates SET original_image_path = ? WHERE id = ?", [backupPath, req.params.id]);
+    const { images } = req.body;
+    if (!Array.isArray(images)) {
+      return res.status(400).json({ error: "images must be an array" });
     }
-    const formData = new FormData();
-    formData.append("image_file", new Blob([imageData]), path.basename(fullPath));
-    formData.append("size", "auto");
-    formData.append("bg_color", "F5F2ED");
-    const bgRes = await fetch("https://api.remove.bg/v1.0/removebg", { method: "POST", headers: { "X-Api-Key": apiKey }, body: formData });
-    if (!bgRes.ok) return res.status(500).json({ error: `remove.bg: ${bgRes.status}` });
-    fs.writeFileSync(fullPath, Buffer.from(await bgRes.arrayBuffer()));
-    res.json({ ok: true, path: item.image_path });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
 
-app.post("/api/edit/:id/enhance", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (!item?.image_path) return res.status(400).json({ error: "No image" });
-    const fullPath = path.resolve(__dirname, item.image_path);
-    if (!item.original_image_path) {
-      const backupPath = item.image_path.replace(/(\.\w+)$/, "_original$1");
-      fs.copyFileSync(fullPath, path.resolve(__dirname, backupPath));
-      await run(db, "UPDATE candidates SET original_image_path = ? WHERE id = ?", [backupPath, req.params.id]);
-    }
-    let sharp;
-    try { sharp = require("sharp"); } catch (_) {
-      return res.status(500).json({ error: "sharp not available — image enhancement requires sharp" });
-    }
-    const enhanced = await sharp(fullPath)
-      .modulate({ brightness: 1.02, saturation: 0.87 })
-      .linear(1.08, -10)
-      .sharpen({ sigma: 1.2, m1: 0.8, m2: 0.4 })
-      .tint({ r: 250, g: 245, b: 235 })
-      .resize(800, 1000, { fit: "contain", background: { r: 245, g: 242, b: 237, alpha: 1 } })
-      .flatten({ background: { r: 245, g: 242, b: 237 } })
-      .jpeg({ quality: 92 })
-      .toBuffer();
-    const enhancedPath = item.image_path.replace(/(\.\w+)$/, "_enhanced.jpg");
-    fs.writeFileSync(path.resolve(__dirname, enhancedPath), enhanced);
-    res.json({ ok: true, enhanced_path: enhancedPath, original_path: item.original_image_path || item.image_path });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    // Pre-read for event metadata (before-count). Not a guard.
+    const before = await queryOne(db, "SELECT all_images FROM candidates WHERE id = ?", [id]);
+    let beforeCount = 0;
+    if (before) { try { beforeCount = JSON.parse(before.all_images || "[]").length; } catch (_) {} }
 
-app.post("/api/edit/:id/apply-enhanced", async (req, res) => {
-  try { const { run } = require("./db"); await run(db, "UPDATE candidates SET image_path = ? WHERE id = ?", [req.body.enhanced_path, req.params.id]); res.json({ ok: true }); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
+    const timestamp = now();
+    const primaryImage = images.length > 0 ? images[0] : null;
 
-app.post("/api/edit/:id/revert-image", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (item?.original_image_path) await run(db, "UPDATE candidates SET image_path = ?, original_image_path = NULL WHERE id = ?", [item.original_image_path, req.params.id]);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+    // Guarded mutation: only updates if item is visible in Staging
+    const result = await run(db,
+      `UPDATE candidates SET all_images = ?, image_url = ?, updated_at = ?
+       WHERE id = ? AND ${STAGING_VISIBILITY}`,
+      [JSON.stringify(images), primaryImage, timestamp, id]
+    );
 
-app.post("/api/edit/:id/publish", async (req, res) => {
-  try { const { publishCandidate } = require("./publisher"); res.json(await publishCandidate(parseInt(req.params.id), db)); }
-  catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post("/api/edit/:id/unpublish", async (req, res) => {
-  try {
-    const { queryOne, run } = require("./db");
-    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [req.params.id]);
-    if (!item?.shopify_product_id) return res.status(400).json({ error: "Not published" });
-    const STORE = process.env.SHOPIFY_STORE_URL;
-    const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
-    if (STORE && TOKEN) {
-      await fetch(`https://${STORE}/admin/api/2024-01/products/${item.shopify_product_id}.json`, {
-        method: "PUT", headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
-        body: JSON.stringify({ product: { id: item.shopify_product_id, status: "draft" } }),
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const item = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+      if (!item) return res.status(404).json({ error: "Item not found" });
+      return res.status(409).json({
+        error: "Item is not editable in Staging in its current state",
+        current_stage: item.stage, processing_status: item.processing_status, review_status: item.review_status,
       });
     }
-    await run(db, "UPDATE candidates SET status = 'editing', shopify_product_id = NULL, shopify_url = NULL WHERE id = ?", [req.params.id]);
+
+    await logEvent(id, "gallery_edited", null, null, {
+      image_count_before: beforeCount,
+      image_count_after: images.length,
+    });
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/staging/:id/gallery]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/staging/:id/metadata — update gender, category, price
+//
+// Mutation-guarded: UPDATE includes STAGING_VISIBILITY in WHERE clause.
+app.put("/api/staging/:id/metadata", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const { gender, detected_category, edited_price, edited_name, edited_description } = req.body;
+
+    // Validate provided fields before touching the database
+    if (gender !== undefined && !VALID_GENDERS.includes(gender)) {
+      return res.status(400).json({ error: `Invalid gender. Expected: ${VALID_GENDERS.join(", ")}` });
+    }
+    if (detected_category !== undefined && !VALID_CATEGORIES.includes(detected_category)) {
+      return res.status(400).json({ error: `Invalid category. Expected: ${VALID_CATEGORIES.join(", ")}` });
+    }
+    if (edited_price !== undefined && (typeof edited_price !== "number" || isNaN(edited_price))) {
+      return res.status(400).json({ error: "edited_price must be a number" });
+    }
+    if (edited_name !== undefined && typeof edited_name !== "string") {
+      return res.status(400).json({ error: "edited_name must be a string" });
+    }
+    if (edited_description !== undefined && typeof edited_description !== "string") {
+      return res.status(400).json({ error: "edited_description must be a string" });
+    }
+
+    // Build dynamic SET clause
+    const sets = [];
+    const params = [];
+    const changedFields = [];
+
+    if (edited_name !== undefined) { sets.push("edited_name = ?"); params.push(edited_name); changedFields.push("edited_name"); }
+    if (edited_description !== undefined) { sets.push("edited_description = ?"); params.push(edited_description); changedFields.push("edited_description"); }
+    if (gender !== undefined) { sets.push("gender = ?"); params.push(gender); changedFields.push("gender"); }
+    if (detected_category !== undefined) { sets.push("detected_category = ?"); params.push(detected_category); changedFields.push("detected_category"); }
+    if (edited_price !== undefined) { sets.push("edited_price = ?"); params.push(edited_price); changedFields.push("edited_price"); }
+
+    if (sets.length === 0) {
+      return res.status(400).json({ error: "No valid fields provided" });
+    }
+
+    const timestamp = now();
+    sets.push("updated_at = ?");
+    params.push(timestamp);
+    params.push(id);
+
+    // Guarded mutation: only updates if item is visible in Staging
+    const result = await run(db,
+      `UPDATE candidates SET ${sets.join(", ")} WHERE id = ? AND ${STAGING_VISIBILITY}`,
+      params
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const item = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+      if (!item) return res.status(404).json({ error: "Item not found" });
+      return res.status(409).json({
+        error: "Item is not editable in Staging in its current state",
+        current_stage: item.stage, processing_status: item.processing_status, review_status: item.review_status,
+      });
+    }
+
+    await logEvent(id, "edited", null, null, { fields_changed: changedFields });
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/staging/:id/metadata]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/staging/:id/remove — transition: staged → removed (T5)
+//
+// Guarded UPDATE: only removes items currently visible in Staging.
+// Uses the full Staging visibility condition in the WHERE clause
+// so items in processing queue or awaiting review cannot be removed
+// through this endpoint.
+app.post("/api/staging/:id/remove", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      `UPDATE candidates SET stage = 'removed', updated_at = ?
+       WHERE id = ? AND ${STAGING_VISIBILITY}`,
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      // Diagnose: does the item exist? Is it in the wrong state?
+      const item = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+      if (!item) {
+        return res.status(404).json({ error: "Item not found" });
+      }
+      return res.status(409).json({
+        error: "Item cannot be removed from Staging in its current state",
+        current_stage: item.stage,
+        processing_status: item.processing_status,
+        review_status: item.review_status,
+      });
+    }
+
+    await logEvent(id, "removed", "staged", "removed", null);
+
     res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error("[api/staging/:id/remove]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// STAGING — Split (T3/T3a)
+// ---------------------------------------------------------------------------
+
+// POST /api/staging/:id/split — create a split child from a staged parent
+//
+// Uses db.transaction('write') for true rollback semantics.
+// The guarded parent UPDATE, child INSERT, and event INSERTs all execute
+// inside one transaction. If the parent guard fails (0 rows affected),
+// the transaction is rolled back — no child row, no events, no side effects.
+app.post("/api/staging/:id/split", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const { image_url, variant_id, variant_name, available_sizes } = req.body;
+
+    if (!image_url || typeof image_url !== "string") {
+      return res.status(400).json({ error: "image_url is required" });
+    }
+    if (available_sizes !== undefined && !Array.isArray(available_sizes)) {
+      return res.status(400).json({ error: "available_sizes must be an array" });
+    }
+
+    // Pre-read parent for data needed to build child and compute gallery diff.
+    // Not a guard — the guarded UPDATE inside the transaction protects the mutation.
+    const parent = await requireStagingItem(res, id);
+    if (!parent) return;
+
+    const timestamp = now();
+    const splitGroupId = parent.split_group_id || parent.id;
+
+    const variantSpecifics = JSON.stringify({
+      color_property: variant_id || null,
+      color_name: variant_name || null,
+      available_sizes: available_sizes || null,
+      parent_id: parent.id,
+    });
+
+    // Compute updated parent gallery
+    let parentGallery = [];
+    try { parentGallery = JSON.parse(parent.all_images || "[]"); } catch (_) {}
+    const cleanUrl = (u) => { const m = (u || "").match(/^(.*?\.(?:jpg|jpeg|png))/i); return m ? m[1] : u; };
+    const splitCleaned = cleanUrl(image_url);
+    const updatedGallery = parentGallery.filter((u) => cleanUrl(u) !== splitCleaned && u !== image_url);
+    const newHero = updatedGallery.length > 0 ? updatedGallery[0] : null;
+
+    // Open a write transaction — all changes commit or rollback together
+    const tx = await db.transaction("write");
+    let childId = 0;
+
+    try {
+      // [1] Guarded parent gallery update
+      const parentResult = await tx.execute({
+        sql: `UPDATE candidates SET all_images = ?, image_url = ?, updated_at = ?
+              WHERE id = ? AND ${STAGING_VISIBILITY}`,
+        args: [JSON.stringify(updatedGallery), newHero, timestamp, id],
+      });
+
+      if ((parentResult?.rowsAffected ?? 0) === 0) {
+        // Parent guard failed — rollback everything and diagnose
+        await tx.rollback();
+        const current = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+        if (!current) return res.status(404).json({ error: "Item not found" });
+        return res.status(409).json({
+          error: "Parent item is not editable in Staging in its current state",
+          current_stage: current.stage,
+          processing_status: current.processing_status,
+          review_status: current.review_status,
+        });
+      }
+
+      // [2] Child insert
+      const childResult = await tx.execute({
+        sql: `INSERT INTO candidates (
+                title, image_url, all_images, source, ali_product_id, product_url,
+                price, shipping_cost, gender, detected_category,
+                stage, processing_status, review_status,
+                parent_id, split_group_id, is_split_child, variant_specifics,
+                staged_at, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, NULL, ?, ?, 1, ?, ?, ?, ?)`,
+        args: [
+          parent.title, image_url, JSON.stringify([image_url]),
+          parent.source, parent.ali_product_id, parent.product_url,
+          parent.price, parent.shipping_cost, parent.gender, parent.detected_category,
+          parent.id, splitGroupId, variantSpecifics,
+          timestamp, timestamp, timestamp,
+        ],
+      });
+
+      childId = Number(childResult?.lastInsertRowid ?? 0);
+
+      // [3] Event: parent split
+      await tx.execute({
+        sql: "INSERT INTO item_events (candidate_id, event_type, from_stage, to_stage, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        args: [id, "split_created", null, null, JSON.stringify({
+          parent_id: parent.id, child_id: childId,
+          variant_image_url: image_url,
+          variant_id: variant_id || null, variant_name: variant_name || null,
+        }), timestamp],
+      });
+
+      // [4] Event: child created by split
+      await tx.execute({
+        sql: "INSERT INTO item_events (candidate_id, event_type, from_stage, to_stage, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        args: [childId, "split_created", null, "staged", JSON.stringify({
+          parent_id: parent.id, child_id: childId,
+          variant_image_url: image_url, created_by: "split",
+        }), timestamp],
+      });
+
+      // All succeeded — commit
+      await tx.commit();
+    } catch (txErr) {
+      // Any error inside the transaction — rollback and re-throw
+      try { await tx.rollback(); } catch (_) {}
+      throw txErr;
+    }
+
+    // Read the committed child row for the response
+    const child = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [childId]);
+    res.json({
+      child,
+      parent_id: parent.id,
+      updated_parent_gallery: updatedGallery,
+    });
+  } catch (err) {
+    console.error("[api/staging/:id/split]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// STAGING — Process (P1)
+// ---------------------------------------------------------------------------
+
+// POST /api/staging/:id/process — send a Staging item into Ghost Logic processing
+//
+// Guarded mutation: sets processing_status='pending' only on items
+// currently visible in Staging. Stage remains 'staged'.
+// Creates a processing_jobs row for tracking.
+app.post("/api/staging/:id/process", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    // Check for usable image before attempting mutation.
+    // We need to read the item to verify image availability.
+    const item = await queryOne(db, "SELECT all_images, image_url FROM candidates WHERE id = ?", [id]);
+    if (!item) return res.status(404).json({ error: "Item not found" });
+
+    let hasImage = false;
+    try {
+      const gallery = JSON.parse(item.all_images || "[]");
+      if (gallery.length > 0) hasImage = true;
+    } catch (_) {}
+    if (!hasImage && item.image_url) hasImage = true;
+
+    if (!hasImage) {
+      return res.status(400).json({ error: "Cannot process: no usable image. Fetch gallery or set image_url first." });
+    }
+
+    const timestamp = now();
+
+    // Single atomic guarded mutation: sets processing_status='pending',
+    // clears review_status if revision_needed (R4), updates timestamps.
+    // CASE expression handles the conditional review_status clear in one UPDATE.
+    const result = await run(db,
+      `UPDATE candidates SET
+        processing_status = 'pending',
+        review_status = CASE WHEN review_status = 'revision_needed' THEN NULL ELSE review_status END,
+        processing_started_at = ?,
+        updated_at = ?
+       WHERE id = ? AND ${STAGING_VISIBILITY}`,
+      [timestamp, timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const current = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+      if (!current) return res.status(404).json({ error: "Item not found" });
+      return res.status(409).json({
+        error: "Item cannot be sent to processing in its current state",
+        current_stage: current.stage,
+        processing_status: current.processing_status,
+        review_status: current.review_status,
+      });
+    }
+
+    // Create processing_jobs row
+    const jobResult = await run(db,
+      "INSERT INTO processing_jobs (candidate_id, status, created_at) VALUES (?, 'pending', ?)",
+      [id, timestamp]
+    );
+
+    const jobId = Number(jobResult?.lastInsertRowid ?? 0);
+
+    await logEvent(id, "processing_submitted", null, null, { processing_job_id: jobId });
+
+    // --- Execution path: local direct vs production queue ---
+    //
+    // Local mode (no REDIS_URL): await processCandidate directly in the request.
+    // No queue, no fire-and-forget, no pending limbo. The response includes the
+    // FINAL state (ready/failed). Pipeline takes 30-60s — acceptable for local dev.
+    //
+    // Production mode (REDIS_URL set): enqueue to BullMQ, return immediately at
+    // 'pending'. Worker picks up the job asynchronously.
+    const isLocalMode = !process.env.REDIS_URL;
+
+    if (isLocalMode) {
+      console.log(`[api/staging/${id}/process] Local mode — running Ghost Logic directly for candidate ${id}`);
+      try {
+        const result = await processCandidate(id, db);
+        console.log(`[ghost-direct][${id}] Pipeline complete ✓ baseline: ${result.baseline}`);
+      } catch (err) {
+        // processCandidate's outer catch guarantees processing_status='failed' in DB
+        console.error(`[ghost-direct][${id}] Pipeline failed: ${err.message}`);
+      }
+    } else {
+      const enqueued = await enqueueProcessingJob(jobId, id);
+      if (!enqueued) {
+        console.error(`[api/staging/${id}/process] Production mode but queue unavailable — candidate ${id} stuck at pending. Check REDIS_URL.`);
+      }
+    }
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/staging/:id/process]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PROCESSING MONITOR
+// ---------------------------------------------------------------------------
+
+// Stale-pending guard: legacy pre-canonical rows have processing_status='pending' from the
+// column DEFAULT but were never actually submitted for processing (no processing_started_at,
+// no processing_jobs row). Require processing_started_at to be set for pending/processing items.
+// Failed items always show (they were processed and failed — they have started_at).
+const PROCESSING_VISIBILITY = `stage = 'staged' AND (
+  (processing_status IN ('pending', 'processing') AND processing_started_at IS NOT NULL)
+  OR processing_status = 'failed'
+)`;
+
+// Helper: diagnose processing mutation failure (item missing vs wrong state)
+async function diagnoseProcessingFailure(id) {
+  const item = await queryOne(db, "SELECT id, stage, processing_status, review_status FROM candidates WHERE id = ?", [id]);
+  if (!item) {
+    return { status: 404, body: { error: "Item not found" } };
+  }
+  return {
+    status: 409,
+    body: {
+      error: "Item is not in the expected processing state",
+      current_stage: item.stage,
+      processing_status: item.processing_status,
+      review_status: item.review_status,
+    },
+  };
+}
+
+// GET /api/processing — items visible in the Processing monitor
+//
+// Sorted: failed first, then processing, then pending.
+// Within each group, newest first by processing_started_at.
+app.get("/api/processing", requireDb, async (req, res) => {
+  try {
+    const items = await queryAll(db, `
+      SELECT c.*,
+        (SELECT pj.id FROM processing_jobs pj
+         WHERE pj.candidate_id = c.id ORDER BY pj.id DESC LIMIT 1) as latest_job_id,
+        (SELECT pj.status FROM processing_jobs pj
+         WHERE pj.candidate_id = c.id ORDER BY pj.id DESC LIMIT 1) as latest_job_status,
+        (SELECT pj.error_message FROM processing_jobs pj
+         WHERE pj.candidate_id = c.id ORDER BY pj.id DESC LIMIT 1) as latest_job_error,
+        (SELECT pj.started_at FROM processing_jobs pj
+         WHERE pj.candidate_id = c.id ORDER BY pj.id DESC LIMIT 1) as latest_job_started_at
+      FROM candidates c
+      WHERE ${PROCESSING_VISIBILITY}
+      ORDER BY
+        CASE c.processing_status
+          WHEN 'failed' THEN 0
+          WHEN 'processing' THEN 1
+          WHEN 'pending' THEN 2
+        END,
+        COALESCE(c.processing_started_at, c.created_at) DESC
+    `);
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/processing]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/processing/:id — single processing item with job history
+app.get("/api/processing/:id", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    if (!item) return res.status(404).json({ error: "Item not found" });
+
+    // Verify item belongs to Processing monitor
+    const inProcessing =
+      item.stage === "staged" &&
+      ["pending", "processing", "failed"].includes(item.processing_status);
+
+    if (!inProcessing) {
+      return res.status(409).json({
+        error: `Item is not visible in Processing (stage='${item.stage}', processing_status='${item.processing_status}')`,
+        current_stage: item.stage,
+        processing_status: item.processing_status,
+        review_status: item.review_status,
+      });
+    }
+
+    // Include processing job history, newest first
+    const jobs = await queryAll(db,
+      "SELECT * FROM processing_jobs WHERE candidate_id = ? ORDER BY id DESC",
+      [id]
+    );
+
+    res.json({ ...item, processing_jobs: jobs });
+  } catch (err) {
+    console.error("[api/processing/:id]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/processing/:id/retry — retry a failed/stuck processing item (P5)
+//
+// Guarded: only retries items where stage='staged' AND processing_status IN ('failed','pending').
+// Accepts both failed items and stuck-pending items (worker crashed without updating status).
+// Creates a new processing_jobs row. Does not change stage.
+app.post("/api/processing/:id/retry", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      `UPDATE candidates SET processing_status = 'pending', processing_started_at = ?, updated_at = ?
+       WHERE id = ? AND stage = 'staged' AND processing_status IN ('failed', 'pending')`,
+      [timestamp, timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseProcessingFailure(id);
+      return res.status(diag.status).json(diag.body);
+    }
+
+    // Create new processing_jobs row for this retry attempt
+    const jobResult = await run(db,
+      "INSERT INTO processing_jobs (candidate_id, status, created_at) VALUES (?, 'pending', ?)",
+      [id, timestamp]
+    );
+    const jobId = Number(jobResult?.lastInsertRowid ?? 0);
+
+    await logEvent(id, "processing_retried", null, null, { processing_job_id: jobId });
+
+    // Local mode: await directly. Production: enqueue to BullMQ.
+    const isLocalMode = !process.env.REDIS_URL;
+
+    if (isLocalMode) {
+      console.log(`[api/processing/${id}/retry] Local mode — running Ghost Logic directly for candidate ${id}`);
+      try {
+        const result = await processCandidate(id, db);
+        console.log(`[ghost-direct][${id}] Retry complete ✓ baseline: ${result.baseline}`);
+      } catch (err) {
+        console.error(`[ghost-direct][${id}] Retry failed: ${err.message}`);
+      }
+    } else {
+      const enqueued = await enqueueProcessingJob(jobId, id);
+      if (!enqueued) {
+        console.error(`[api/processing/${id}/retry] Production mode but queue unavailable — candidate ${id} stuck at pending. Check REDIS_URL.`);
+      }
+    }
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/processing/:id/retry]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/processing/:id/return — return a failed/stuck item to Staging (P6)
+//
+// Guarded: only returns items where stage='staged' AND processing_status IN ('failed','pending').
+// Accepts both failed items and stuck-pending items (worker crashed without updating status).
+// Clears processing_status to NULL. Does not change stage.
+app.post("/api/processing/:id/return", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      `UPDATE candidates SET processing_status = NULL, updated_at = ?
+       WHERE id = ? AND stage = 'staged' AND processing_status IN ('failed', 'pending')`,
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseProcessingFailure(id);
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "processing_returned", null, null, null);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/processing/:id/return]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PHOTO SUITE
+// ---------------------------------------------------------------------------
+
+// Canonical Photo Suite pool: items ready for review
+const PHOTO_SUITE_POOL = `stage = 'staged' AND processing_status = 'ready' AND review_status IS NULL`;
+
+// Helper: generate a unique session id
+function sessionId() {
+  return `rs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Helper: find the current active review session (session-mode first, then flow)
+async function getActiveSession() {
+  // Session-mode takes priority
+  const session = await queryOne(db,
+    "SELECT * FROM review_sessions WHERE status = 'active' AND mode = 'session' ORDER BY started_at DESC LIMIT 1"
+  );
+  if (session) return session;
+  return await queryOne(db,
+    "SELECT * FROM review_sessions WHERE status = 'active' AND mode = 'flow' ORDER BY started_at DESC LIMIT 1"
+  );
+}
+
+// Helper: validate that an item is reviewable under the current session's ownership rules.
+// Returns { item, session } or sends an error response and returns null.
+async function requireReviewableItem(res, id) {
+  const item = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+  if (!item) {
+    res.status(404).json({ error: "Item not found" });
+    return null;
+  }
+
+  // Must be in the Photo Suite pool regardless of session mode
+  const inPool = item.stage === "staged"
+    && item.processing_status === "ready"
+    && !item.review_status;
+
+  if (!inPool) {
+    res.status(409).json({
+      error: `Item is not reviewable (stage='${item.stage}', processing_status='${item.processing_status}', review_status='${item.review_status || "null"}')`,
+      current_stage: item.stage,
+      processing_status: item.processing_status,
+      review_status: item.review_status,
+    });
+    return null;
+  }
+
+  const session = await getActiveSession();
+  if (!session) {
+    res.status(404).json({ error: "No active Photo Suite session. Start one first." });
+    return null;
+  }
+
+  // Enforce session ownership
+  if (session.mode === "session") {
+    // Session mode: item must be locked to THIS session
+    if (item.review_session_id !== session.id) {
+      res.status(409).json({
+        error: "Item is not locked to the current session",
+        item_session_id: item.review_session_id || null,
+        active_session_id: session.id,
+      });
+      return null;
+    }
+  } else {
+    // Flow mode: item must not be locked to an active session-mode session
+    if (item.review_session_id) {
+      const lockOwner = await queryOne(db,
+        "SELECT id FROM review_sessions WHERE id = ? AND status = 'active' AND mode = 'session'",
+        [item.review_session_id]
+      );
+      if (lockOwner) {
+        res.status(409).json({
+          error: "Item is locked to an active session-mode session",
+          locked_to_session: item.review_session_id,
+        });
+        return null;
+      }
+    }
+  }
+
+  return { item, session };
+}
+
+// Helper: increment a session counter after a review action
+async function incrementSessionCounter(sessionId, field) {
+  if (!sessionId) return;
+  await run(db,
+    `UPDATE review_sessions SET items_reviewed = items_reviewed + 1, ${field} = ${field} + 1 WHERE id = ?`,
+    [sessionId]
+  );
+}
+
+// GET /api/photo-suite — base route returns pool status
+//
+// Gives callers a summary of the Photo Suite state (pool count, active session).
+// The Photo Suite workflow uses sub-routes: /ready-count, /next, /start-flow, etc.
+app.get("/api/photo-suite", requireDb, async (req, res) => {
+  try {
+    const pool = await queryOne(db, `SELECT COUNT(*) as c FROM candidates WHERE ${PHOTO_SUITE_POOL}`);
+    const session = await getActiveSession();
+    res.json({
+      pool_count: pool?.c || 0,
+      active_session: session ? { id: session.id, mode: session.mode, status: session.status } : null,
+      endpoints: ["/api/photo-suite/ready-count", "/api/photo-suite/start-flow", "/api/photo-suite/next"],
+    });
+  } catch (err) {
+    console.error("[api/photo-suite]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/photo-suite/ready-count
+//
+// Count of reviewable items: ready, unreviewed, not locked to an active session.
+app.get("/api/photo-suite/ready-count", requireDb, async (req, res) => {
+  try {
+    const result = await queryOne(db, `
+      SELECT COUNT(*) as c FROM candidates
+      WHERE ${PHOTO_SUITE_POOL}
+      AND (review_session_id IS NULL
+           OR review_session_id NOT IN (
+             SELECT id FROM review_sessions WHERE status = 'active' AND mode = 'session'
+           ))
+    `);
+    res.json({ count: result?.c || 0 });
+  } catch (err) {
+    console.error("[api/photo-suite/ready-count]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/start-flow
+//
+// Start Flow Mode: create a session row, don't lock any items.
+// If an active session-mode session exists, reject (abandon it first).
+// If an active flow session already exists, return it (no duplicates).
+app.post("/api/photo-suite/start-flow", requireDb, async (req, res) => {
+  try {
+    // Block if a session-mode session is active
+    const activeSessionMode = await queryOne(db,
+      "SELECT * FROM review_sessions WHERE status = 'active' AND mode = 'session' LIMIT 1"
+    );
+    if (activeSessionMode) {
+      return res.status(409).json({
+        error: "An active session-mode session exists. Abandon it before starting flow.",
+        active_session: activeSessionMode,
+      });
+    }
+
+    // Return existing active flow session if one exists
+    const existingFlow = await queryOne(db,
+      "SELECT * FROM review_sessions WHERE status = 'active' AND mode = 'flow' ORDER BY started_at DESC LIMIT 1"
+    );
+    if (existingFlow) {
+      return res.json(existingFlow);
+    }
+
+    const id = sessionId();
+    const timestamp = now();
+
+    await run(db,
+      "INSERT INTO review_sessions (id, mode, status, started_at) VALUES (?, 'flow', 'active', ?)",
+      [id, timestamp]
+    );
+
+    const session = await queryOne(db, "SELECT * FROM review_sessions WHERE id = ?", [id]);
+    res.json(session);
+  } catch (err) {
+    console.error("[api/photo-suite/start-flow]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/start-session
+//
+// Start Session Mode: create a session row, lock up to batch_size items.
+// Rejects if any active session (session or flow) already exists.
+app.post("/api/photo-suite/start-session", requireDb, async (req, res) => {
+  try {
+    const { batch_size } = req.body;
+
+    if (!batch_size || !Number.isInteger(batch_size) || batch_size < 1) {
+      return res.status(400).json({ error: "batch_size must be a positive integer" });
+    }
+
+    // Block if any active session exists
+    const existing = await queryOne(db,
+      "SELECT * FROM review_sessions WHERE status = 'active' ORDER BY started_at DESC LIMIT 1"
+    );
+    if (existing) {
+      return res.status(409).json({
+        error: `An active ${existing.mode}-mode session already exists. Abandon it first.`,
+        active_session: existing,
+      });
+    }
+
+    const id = sessionId();
+    const timestamp = now();
+
+    // Create session row
+    await run(db,
+      "INSERT INTO review_sessions (id, mode, batch_size, status, started_at) VALUES (?, 'session', ?, 'active', ?)",
+      [id, batch_size, timestamp]
+    );
+
+    // Select items from the pool, excluding those locked to another active session
+    const items = await queryAll(db, `
+      SELECT id FROM candidates
+      WHERE ${PHOTO_SUITE_POOL}
+      AND (review_session_id IS NULL
+           OR review_session_id NOT IN (
+             SELECT rs.id FROM review_sessions rs WHERE rs.status = 'active' AND rs.mode = 'session'
+           ))
+      ORDER BY COALESCE(processing_completed_at, created_at) DESC
+      LIMIT ?
+    `, [batch_size]);
+
+    // Lock selected items
+    let lockedCount = 0;
+    for (const item of items) {
+      const result = await run(db,
+        `UPDATE candidates SET review_session_id = ?, updated_at = ?
+         WHERE id = ? AND ${PHOTO_SUITE_POOL}`,
+        [id, timestamp, item.id]
+      );
+      const affected = result?.rowsAffected ?? result?.changes ?? 0;
+      if (affected > 0) lockedCount++;
+    }
+
+    const session = await queryOne(db, "SELECT * FROM review_sessions WHERE id = ?", [id]);
+    res.json({ session, locked_count: lockedCount });
+  } catch (err) {
+    console.error("[api/photo-suite/start-session]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/photo-suite/next
+//
+// Return the next item for the current active Photo Suite session.
+// Session-mode sessions take priority over flow-mode.
+app.get("/api/photo-suite/next", requireDb, async (req, res) => {
+  try {
+    const session = await getActiveSession();
+
+    if (!session) {
+      return res.status(404).json({ error: "No active Photo Suite session. Start one with /api/photo-suite/start-flow or /api/photo-suite/start-session." });
+    }
+
+    let item = null;
+
+    if (session.mode === "session") {
+      // Session Mode: return next item locked to this session
+      item = await queryOne(db, `
+        SELECT * FROM candidates
+        WHERE ${PHOTO_SUITE_POOL}
+        AND review_session_id = ?
+        ORDER BY COALESCE(processing_completed_at, created_at) DESC
+        LIMIT 1
+      `, [session.id]);
+    } else {
+      // Flow Mode: return next unlocked item from the pool
+      item = await queryOne(db, `
+        SELECT * FROM candidates
+        WHERE ${PHOTO_SUITE_POOL}
+        AND (review_session_id IS NULL
+             OR review_session_id NOT IN (
+               SELECT rs.id FROM review_sessions rs WHERE rs.status = 'active' AND rs.mode = 'session'
+             ))
+        ORDER BY COALESCE(processing_completed_at, created_at) DESC
+        LIMIT 1
+      `);
+    }
+
+    if (!item) {
+      return res.json({ done: true, session });
+    }
+
+    res.json(item);
+  } catch (err) {
+    console.error("[api/photo-suite/next]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/:id/accept
+//
+// Transition: review_status null → accepted, stage staged → approved
+// Guarded mutation enforces session ownership in SQL.
+app.post("/api/photo-suite/:id/accept", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const check = await requireReviewableItem(res, id);
+    if (!check) return;
+    const { session } = check;
+
+    const timestamp = now();
+
+    // Session-aware guarded UPDATE:
+    // - session mode: item must be locked to this session
+    // - flow mode: item must not be locked to an active session-mode session
+    const sessionGuard = session.mode === "session"
+      ? "AND review_session_id = ?"
+      : "AND (review_session_id IS NULL OR review_session_id NOT IN (SELECT rs.id FROM review_sessions rs WHERE rs.status = 'active' AND rs.mode = 'session'))";
+    const params = session.mode === "session"
+      ? [timestamp, timestamp, timestamp, id, session.id]
+      : [timestamp, timestamp, timestamp, id];
+
+    const result = await run(db,
+      `UPDATE candidates SET
+        review_status = 'accepted',
+        stage = 'approved',
+        reviewed_at = ?,
+        approved_at = ?,
+        updated_at = ?,
+        review_session_id = NULL
+       WHERE id = ? AND ${PHOTO_SUITE_POOL} ${sessionGuard}`,
+      params
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      return res.status(409).json({ error: "Item state changed during review — refresh and try again" });
+    }
+
+    await incrementSessionCounter(session.id, "items_accepted");
+    await logEvent(id, "review_accepted", "staged", "approved", {
+      session_id: session.id,
+    });
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/photo-suite/:id/accept]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/:id/reject
+//
+// Transition: review_status null → revision_needed, processing_status ready → null.
+// Stage remains staged. Clears generated content so Ghost Logic re-processes.
+// Guarded mutation enforces session ownership in SQL.
+app.post("/api/photo-suite/:id/reject", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const check = await requireReviewableItem(res, id);
+    if (!check) return;
+    const { session } = check;
+
+    const timestamp = now();
+
+    const sessionGuard = session.mode === "session"
+      ? "AND review_session_id = ?"
+      : "AND (review_session_id IS NULL OR review_session_id NOT IN (SELECT rs.id FROM review_sessions rs WHERE rs.status = 'active' AND rs.mode = 'session'))";
+    const params = session.mode === "session"
+      ? [timestamp, timestamp, id, session.id]
+      : [timestamp, timestamp, id];
+
+    const result = await run(db,
+      `UPDATE candidates SET
+        review_status = 'revision_needed',
+        processing_status = NULL,
+        processed_image_url = NULL,
+        generated_name = NULL,
+        generated_description = NULL,
+        reviewed_at = ?,
+        updated_at = ?,
+        review_session_id = NULL
+       WHERE id = ? AND ${PHOTO_SUITE_POOL} ${sessionGuard}`,
+      params
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      return res.status(409).json({ error: "Item state changed during review — refresh and try again" });
+    }
+
+    await incrementSessionCounter(session.id, "items_rejected");
+    await logEvent(id, "review_rejected", null, null, {
+      session_id: session.id,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/photo-suite/:id/reject]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/:id/discard
+//
+// Transition: review_status null → discarded, stage staged → removed.
+// Guarded mutation enforces session ownership in SQL.
+app.post("/api/photo-suite/:id/discard", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const check = await requireReviewableItem(res, id);
+    if (!check) return;
+    const { session } = check;
+
+    const timestamp = now();
+
+    const sessionGuard = session.mode === "session"
+      ? "AND review_session_id = ?"
+      : "AND (review_session_id IS NULL OR review_session_id NOT IN (SELECT rs.id FROM review_sessions rs WHERE rs.status = 'active' AND rs.mode = 'session'))";
+    const params = session.mode === "session"
+      ? [timestamp, timestamp, id, session.id]
+      : [timestamp, timestamp, id];
+
+    const result = await run(db,
+      `UPDATE candidates SET
+        review_status = 'discarded',
+        stage = 'removed',
+        reviewed_at = ?,
+        updated_at = ?,
+        review_session_id = NULL
+       WHERE id = ? AND ${PHOTO_SUITE_POOL} ${sessionGuard}`,
+      params
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      return res.status(409).json({ error: "Item state changed during review — refresh and try again" });
+    }
+
+    await incrementSessionCounter(session.id, "items_discarded");
+    await logEvent(id, "review_discarded", "staged", "removed", {
+      session_id: session.id,
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/photo-suite/:id/discard]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/photo-suite/abandon
+//
+// Abandon the current active session. For session-mode: unlock all locked items.
+// For flow-mode: mark as abandoned.
+app.post("/api/photo-suite/abandon", requireDb, async (req, res) => {
+  try {
+    const session = await getActiveSession();
+
+    if (!session) {
+      return res.status(404).json({ error: "No active Photo Suite session to abandon" });
+    }
+
+    const timestamp = now();
+
+    if (session.mode === "session") {
+      // Unlock all items still locked to this session
+      await run(db,
+        "UPDATE candidates SET review_session_id = NULL, updated_at = ? WHERE review_session_id = ?",
+        [timestamp, session.id]
+      );
+    }
+
+    // Mark session as abandoned
+    await run(db,
+      "UPDATE review_sessions SET status = 'abandoned', completed_at = ? WHERE id = ?",
+      [timestamp, session.id]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/photo-suite/abandon]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// APPROVED
+// ---------------------------------------------------------------------------
+
+// GET /api/approved — all approved items, newest first
+app.get("/api/approved", requireDb, async (req, res) => {
+  try {
+    const items = await queryAll(db, `
+      SELECT * FROM candidates
+      WHERE stage = 'approved'
+      ORDER BY COALESCE(approved_at, created_at) DESC
+    `);
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/approved]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/approved/:id — light editing in Approved
+//
+// Allowed fields: edited_name, edited_description, edited_price,
+// detected_category, gender. Guarded: WHERE stage = 'approved'.
+app.put("/api/approved/:id", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const { edited_name, edited_description, edited_price, detected_category, gender } = req.body;
+
+    // Validate provided fields
+    if (gender !== undefined && !VALID_GENDERS.includes(gender)) {
+      return res.status(400).json({ error: `Invalid gender. Expected: ${VALID_GENDERS.join(", ")}` });
+    }
+    if (detected_category !== undefined && !VALID_CATEGORIES.includes(detected_category)) {
+      return res.status(400).json({ error: `Invalid category. Expected: ${VALID_CATEGORIES.join(", ")}` });
+    }
+    if (edited_price !== undefined && (typeof edited_price !== "number" || isNaN(edited_price))) {
+      return res.status(400).json({ error: "edited_price must be a number" });
+    }
+
+    // Build dynamic SET clause from provided fields only
+    const sets = [];
+    const params = [];
+    const changedFields = [];
+
+    if (edited_name !== undefined) { sets.push("edited_name = ?"); params.push(edited_name); changedFields.push("edited_name"); }
+    if (edited_description !== undefined) { sets.push("edited_description = ?"); params.push(edited_description); changedFields.push("edited_description"); }
+    if (edited_price !== undefined) { sets.push("edited_price = ?"); params.push(edited_price); changedFields.push("edited_price"); }
+    if (detected_category !== undefined) { sets.push("detected_category = ?"); params.push(detected_category); changedFields.push("detected_category"); }
+    if (gender !== undefined) { sets.push("gender = ?"); params.push(gender); changedFields.push("gender"); }
+
+    if (sets.length === 0) {
+      return res.status(400).json({ error: "No valid fields provided" });
+    }
+
+    const timestamp = now();
+    sets.push("updated_at = ?");
+    params.push(timestamp);
+    params.push(id);
+
+    const result = await run(db,
+      `UPDATE candidates SET ${sets.join(", ")} WHERE id = ? AND stage = 'approved'`,
+      params
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "approved");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "edited", null, null, { fields_changed: changedFields });
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/approved/:id]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/approved/:id/to-launch — transition: approved → launch_ready
+app.post("/api/approved/:id/to-launch", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'launch_ready', updated_at = ? WHERE id = ? AND stage = 'approved'",
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "approved");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "moved_to_launch", "approved", "launch_ready", null);
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/approved/:id/to-launch]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/approved/:id/remove — transition: approved → removed
+app.post("/api/approved/:id/remove", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'removed', updated_at = ? WHERE id = ? AND stage = 'approved'",
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "approved");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "removed", "approved", "removed", null);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[api/approved/:id/remove]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// LAUNCH
+// ---------------------------------------------------------------------------
+
+// GET /api/launch — all launch-ready items
+app.get("/api/launch", requireDb, async (req, res) => {
+  try {
+    const items = await queryAll(db, `
+      SELECT * FROM candidates
+      WHERE stage = 'launch_ready'
+      ORDER BY COALESCE(updated_at, created_at) DESC
+    `);
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/launch]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/launch/:id/return — transition: launch_ready → approved
+app.post("/api/launch/:id/return", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'approved', updated_at = ? WHERE id = ? AND stage = 'launch_ready'",
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "launch_ready");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "returned_to_approved", "launch_ready", "approved", null);
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/launch/:id/return]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/launch/:id/publish — transition: launch_ready → published
+//
+// Performs the canonical DB transition. Shopify publisher integration is
+// available in publisher.js but uses legacy fields — wiring deferred.
+// TODO: Wire publishCandidate() from publisher.js once it uses canonical
+//       stage field instead of legacy status. When wired, set
+//       shopify_product_id and shopify_url from the publisher response.
+app.post("/api/launch/:id/publish", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      `UPDATE candidates SET
+        stage = 'published',
+        published_at = ?,
+        updated_at = ?
+       WHERE id = ? AND stage = 'launch_ready'`,
+      [timestamp, timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "launch_ready");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "published", "launch_ready", "published", null);
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/launch/:id/publish]", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
 // LIVE
 // ---------------------------------------------------------------------------
 
-app.get("/api/live", async (req, res) => {
+// GET /api/live — all published items
+app.get("/api/live", requireDb, async (req, res) => {
   try {
-    const { queryAll } = require("./db");
-    res.json({ items: await queryAll(db, "SELECT * FROM candidates WHERE status = 'published' ORDER BY created_at DESC") });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const items = await queryAll(db, `
+      SELECT * FROM candidates
+      WHERE stage = 'published'
+      ORDER BY COALESCE(published_at, updated_at) DESC
+    `);
+    res.json({ items, count: items.length });
+  } catch (err) {
+    console.error("[api/live]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/live/:id/unpublish — transition: published → approved
+//
+// Moves the item back to Approved. Preserves shopify_product_id and
+// shopify_url so they can be referenced if the item is re-published.
+// TODO: Wire Shopify product deactivation when publisher is canonical.
+app.post("/api/live/:id/unpublish", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const timestamp = now();
+
+    const result = await run(db,
+      "UPDATE candidates SET stage = 'approved', updated_at = ? WHERE id = ? AND stage = 'published'",
+      [timestamp, id]
+    );
+
+    const affected = result?.rowsAffected ?? result?.changes ?? 0;
+    if (affected === 0) {
+      const diag = await diagnoseMutationFailure(id, "published");
+      return res.status(diag.status).json(diag.body);
+    }
+
+    await logEvent(id, "unpublished", "published", "approved", null);
+
+    const updated = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [id]);
+    res.json(updated);
+  } catch (err) {
+    console.error("[api/live/:id/unpublish]", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
-// GENDER + CATEGORY
+// SPA fallback (must be AFTER all /api routes)
 // ---------------------------------------------------------------------------
 
-app.patch("/api/candidates/:id/gender", async (req, res) => {
-  try {
-    const { run } = require("./db");
-    const { gender } = req.body;
-    if (!["mens", "womens", "unisex"].includes(gender)) return res.status(400).json({ error: "invalid" });
-    await run(db, "UPDATE candidates SET gender = ? WHERE id = ?", [gender, req.params.id]);
-    res.json({ ok: true, gender });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.patch("/api/candidates/:id/category", async (req, res) => {
-  try {
-    const { run } = require("./db");
-    const { category } = req.body;
-    const valid = ["tops", "bottoms", "outerwear", "footwear", "jewelry", "belts", "accessories"];
-    if (!valid.includes(category)) return res.status(400).json({ error: "invalid" });
-    await run(db, "UPDATE candidates SET detected_category = ? WHERE id = ?", [category, req.params.id]);
-    res.json({ ok: true, category });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ---------------------------------------------------------------------------
-// SPA fallback
-// ---------------------------------------------------------------------------
-
-app.get("/{*path}", (req, res) => {
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api")) return next();
   res.sendFile(path.join(__dirname, "client", "dist", "index.html"));
 });
 
 // ---------------------------------------------------------------------------
-// Start server FIRST, then connect DB in background
+// Start server immediately, connect DB with retry in background
 // ---------------------------------------------------------------------------
 
 app.listen(PORT, () => {
   console.log(`[startup] Server listening on port ${PORT}`);
-  console.log(`[startup] IS_CLOUD=${IS_CLOUD}`);
   console.log(`[startup] TURSO_DATABASE_URL set: ${!!process.env.TURSO_DATABASE_URL}`);
-  console.log(`[startup] TURSO_DATABASE_URL value: ${(process.env.TURSO_DATABASE_URL || '').substring(0, 40)}...`);
-  console.log(`[startup] TURSO_AUTH_TOKEN set: ${!!process.env.TURSO_AUTH_TOKEN}`);
-  console.log(`[startup] TURSO_AUTH_TOKEN starts with: ${(process.env.TURSO_AUTH_TOKEN || '').substring(0, 20)}...`);
-  console.log(`[startup] RAILWAY_ENVIRONMENT: ${process.env.RAILWAY_ENVIRONMENT || 'not set'}`);
 });
 
-// Connect DB async with retry — server is already responding to healthchecks
 async function connectDb(attempt = 1) {
   const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 3000;
+
   try {
-    console.log(`[db-init] Attempt ${attempt}/${MAX_RETRIES}`);
-
-    const { getDb, initSchema } = require("./db");
+    console.log(`[startup] DB connection attempt ${attempt}/${MAX_RETRIES}`);
     db = getDb();
-    await initSchema(db);
 
-    // Verify with simplest possible query
-    console.log(`[db-init] Running: SELECT 1 as test`);
-    const pingResult = await db.execute("SELECT 1 as test");
-    console.log(`[db-init] Ping result: ${JSON.stringify(pingResult.rows)}`);
+    const ping = await db.execute("SELECT 1 as test");
+    console.log(`[startup] DB connected: ${JSON.stringify(ping.rows[0])}`);
 
-    // Count candidates
-    const countResult = await db.execute("SELECT COUNT(*) as c FROM candidates");
-    console.log(`[db-init] Candidates: ${countResult.rows[0]?.c || 0}`);
+    const total = await db.execute("SELECT COUNT(*) as c FROM candidates");
+    console.log(`[startup] Candidates: ${total.rows[0]?.c || 0}`);
 
-    // Status breakdown
-    const statusResult = await db.execute("SELECT status, COUNT(*) as c FROM candidates GROUP BY status");
-    console.log(`[db-init] Statuses: ${JSON.stringify(statusResult.rows)}`);
+    try {
+      const stages = await db.execute(
+        "SELECT stage, COUNT(*) as c FROM candidates WHERE stage IS NOT NULL GROUP BY stage ORDER BY COUNT(*) DESC"
+      );
+      console.log(`[startup] Stages: ${JSON.stringify(stages.rows)}`);
+    } catch (_) {
+      console.log("[startup] WARNING: 'stage' column not found. Run migrate-canonical.js first.");
+    }
 
     dbReady = true;
     dbError = null;
-    console.log(`[db-init] SUCCESS — dbReady=true`);
+    console.log("[startup] DB ready");
   } catch (err) {
-    console.error(`[db-init] Attempt ${attempt} FAILED: ${err.message}`);
-    console.error(`[db-init] Error code: ${err.code || 'none'}`);
-    console.error(`[db-init] Stack: ${err.stack}`);
+    console.error(`[startup] DB attempt ${attempt} failed: ${err.message}`);
 
     if (attempt < MAX_RETRIES) {
-      const delay = attempt * 3000;
-      console.log(`[db-init] Retrying in ${delay / 1000}s...`);
-      await new Promise(r => setTimeout(r, delay));
+      const delay = RETRY_DELAY_MS * attempt;
+      console.log(`[startup] Retrying in ${delay / 1000}s...`);
+      await new Promise((r) => setTimeout(r, delay));
       return connectDb(attempt + 1);
     }
 
     dbError = err.message;
-    console.error(`[db-init] All ${MAX_RETRIES} attempts failed. DB not available.`);
+    console.error(`[startup] All ${MAX_RETRIES} attempts failed. DB not available.`);
   }
 }
 

@@ -41,7 +41,8 @@ For belts: size_mapping should use waist sizes (28-40 inch).
 Rules:
 - Names should feel like Acne Studios or COS, not Shein or H&M
 - Never use generic words like "basic", "classic", "premium"
-- Color names should be evocative: not "blue" but "midnight", not "brown" but "earth", not "black" but "ink"
+- Color names MUST use this palette vocabulary: "bone" (not white/cream), "slate" (not grey), "moss" (not green), "faded black" (not black), "earth" (not brown), "dust" (not beige), "clay" (not tan), "fog" (not light grey), "ink" (not navy), "rust" (not orange/red)
+- NEVER use generic color words like "white", "black", "grey", "green", "blue"
 - Note if the item appears to run oversized in size_mapping
 - Return ONLY valid JSON, no extra text.`;
 

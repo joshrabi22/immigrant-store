@@ -12,13 +12,14 @@ const path = require("path");
 const https = require("https");
 const http = require("http");
 const readline = require("readline");
-const { getDb, initSchema } = require("./db");
+const { getDb, initSchema, run, queryAll } = require("./db");
 
 const CDP_ENDPOINT = "http://localhost:9222";
 const IMAGES_DIR = path.join(__dirname, "images", "orders");
 const CANDIDATES_IMAGES_DIR = path.join(__dirname, "images", "candidates");
 const ORDER_LIST_URL = "https://www.aliexpress.com/p/order/index.html";
 const HOMEPAGE_URL = "https://www.aliexpress.com/";
+const WISHLIST_URL = "https://www.aliexpress.com/p/wish-manage/index.html";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -307,38 +308,64 @@ async function main() {
 async function scrapeSuggestedProducts(page) {
   return page.evaluate(() => {
     const results = [];
-    // AliExpress homepage product cards — try multiple selector strategies
+    const seen = new Set();
+
+    // AliExpress homepage product cards.
+    // Primary: .card-out-wrapper (stable class used in 2024/2025 homepage layout).
+    // Fallbacks for older/alternate layouts.
     const cards = document.querySelectorAll(
-      '[class*="product-card"], [class*="ProductCard"], [class*="feed-item"], ' +
-      '[class*="card-item"], a[href*="/item/"][class*="card"]'
+      '.card-out-wrapper, [class*="product-card"], [class*="ProductCard"], ' +
+      '[class*="feed-item"], [class*="card-item"]'
     );
 
     for (const card of cards) {
-      const linkEl = card.querySelector('a[href*="/item/"]') || (card.matches('a[href*="/item/"]') ? card : null);
+      const linkEl = card.querySelector('a[href*="/item/"]') ||
+        (card.matches('a[href*="/item/"]') ? card : null);
       if (!linkEl) continue;
 
+      // linkEl.href resolves protocol-relative //host/item/... to full URL
       const href = linkEl.href || "";
       const productIdMatch = href.match(/\/item\/(\d+)\.html/);
       const productId = productIdMatch ? productIdMatch[1] : null;
+      if (!productId || seen.has(productId)) continue;
+      seen.add(productId);
 
-      // Title
-      const titleEl = card.querySelector('[class*="title"], [class*="Title"], h3, h2');
-      const title = titleEl ? titleEl.textContent.trim() : "";
+      // Canonical URL — strip locale (he., fr., etc.) back to www.aliexpress.com
+      const productUrl = `https://www.aliexpress.com/item/${productId}.html`;
+
+      // Title: prefer h3 inside card, then heading role, then img alt
+      const h3El = card.querySelector("h3");
+      const headingEl = card.querySelector('[role="heading"]');
+      const imgAltEl = card.querySelector("img.product-img");
+      const title = (h3El?.textContent.trim()) ||
+        (headingEl?.getAttribute("title") || headingEl?.textContent.trim()) ||
+        (imgAltEl?.alt) || "";
       if (!title || title.length < 5) continue;
 
-      // Image — could be img tag or background-image
-      const imgEl = card.querySelector("img[src*='alicdn'], img[data-src*='alicdn'], img");
+      // Image: prefer img.product-img (stable class), then aliexpress-media, then any img
+      const imgEl = card.querySelector("img.product-img") ||
+        card.querySelector("img[src*='ae-pic'], img[src*='alicdn'], img[data-src*='alicdn']") ||
+        card.querySelector("img");
       let imageUrl = null;
       if (imgEl) {
-        imageUrl = imgEl.src || imgEl.getAttribute("data-src");
+        // .src resolves protocol-relative URLs; fall back to attribute
+        imageUrl = imgEl.src || imgEl.getAttribute("data-src") || imgEl.getAttribute("src");
+        // Ensure absolute URL for protocol-relative srcs
+        if (imageUrl && imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
       }
 
-      // Price
-      const priceEl = card.querySelector('[class*="price"], [class*="Price"]');
+      // Price: prefer class-based price container, then aria-label fallback.
+      // [aria-label*="."] is too broad — it matches star ratings, shipping labels, etc.
+      const priceEl = card.querySelector('[class*="price"], [class*="Price"]') ||
+        card.querySelector('[aria-label*="."]');
       let price = null;
       if (priceEl) {
-        const priceText = priceEl.textContent.replace(/[^0-9.]/g, "");
-        if (priceText) price = parseFloat(priceText);
+        const raw = priceEl.getAttribute("aria-label") || priceEl.textContent;
+        const priceText = raw.replace(/[^0-9.]/g, "");
+        if (priceText) {
+          const parsed = parseFloat(priceText);
+          if (isFinite(parsed)) price = parsed;
+        }
       }
 
       results.push({
@@ -346,12 +373,109 @@ async function scrapeSuggestedProducts(page) {
         image_url: imageUrl,
         price,
         ali_product_id: productId,
-        product_url: href,
+        product_url: productUrl,
       });
     }
 
     return results;
   });
+}
+
+// Scrape full product gallery from individual product page.
+// Same logic as alistream.js — kept in sync manually.
+async function scrapeProductGallery(page, productUrl, productId) {
+  try {
+    await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+
+    const result = await page.evaluate(() => {
+      const images = new Set();
+      const variantMap = {};
+
+      document.querySelectorAll(
+        'img[src*="alicdn"], img[data-src*="alicdn"], img[src*="ae-pic"], img[data-src*="ae-pic"]'
+      ).forEach((img) => {
+        const src = img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src");
+        if (src && (src.includes("alicdn") || src.includes("ae-pic"))) images.add(src);
+      });
+
+      document.querySelectorAll(
+        '[class*="sku"] img, [class*="variant"] img, [class*="color"] img, [class*="Sku"] img'
+      ).forEach((img) => {
+        const src = img.src || img.getAttribute("data-src");
+        if (src) images.add(src);
+      });
+
+      const scripts = document.querySelectorAll("script");
+      for (const script of scripts) {
+        const text = script.textContent || "";
+        const imgListMatch = text.match(/"imagePathList"\s*:\s*\[(.*?)\]/);
+        if (imgListMatch) {
+          const urls = imgListMatch[1].match(/"(https?:\/\/[^"]+)"/g);
+          if (urls) urls.forEach((u) => images.add(u.replace(/"/g, "")));
+        }
+        const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
+        for (const m of skuBlocks) {
+          const [_, propId, propName, imgUrl] = m;
+          images.add(imgUrl);
+          variantMap[imgUrl] = { propertyId: propId, propertyName: propName, sizes: [] };
+        }
+      }
+
+      // Known AliExpress page-chrome file hashes (service badges, trust icons,
+      // shipping graphics). These appear across 5-145 different products — never
+      // product images. Derived from cross-product frequency analysis.
+      const PAGE_CHROME = new Set([
+        "Sa976459fb7724bf1bca6e153a425a8ebg","S9e723ca0d10848499e4e3fb33be2224do",
+        "S64c04957a1244dffbab7086d6e1a7cad7","Sb100bd23552d499c9fa8e1499f3c46dbw",
+        "S5c3261cf46fb47aa8c7f3abbdd792574S","Saf2ebe3af38947179531973d0d08ef74Y",
+        "Sd8c759485ca2404d87d8f5d5ed0d98e0K","S16183c3f12904fbbaf3f8aef523f0b73T",
+        "S9bad0c7ed77b4899ae22645df613a766r","Sa42ea28366094829a2e882420e1e269aJ",
+        "S3f91b770226a464c8baf581b22e148f7Y","S5fde9fa3ffdb45cf908380fcc49bf6771",
+        "Sa3e67595f2374efa9ce9f91574dc4650T",
+      ]);
+      const extractHash = (u) => { const m = u.match(/\/kf\/([A-Za-z0-9_]+)/); return m ? m[1] : null; };
+
+      // Multi-layer filter: fingerprints + structural patterns + keywords
+      const filtered = [...images].filter((url) => {
+        if (!url || typeof url !== "string") return false;
+        if (url.length < 30 || url.startsWith("data:")) return false;
+        // Non-CDN (broken/truncated URLs)
+        if (!url.includes("alicdn.com") && !url.includes("aliexpress-media.com")) return false;
+        // Known page chrome
+        const h = extractHash(url);
+        if (h && PAGE_CHROME.has(h)) return false;
+        // Structural: tiny pixel images, thumbnails, quality-suffixed variants
+        if (/\/\d{1,3}x\d{1,3}\.(?:png|jpg|gif)/i.test(url)) return false;
+        if (/_\d{1,3}x\d{1,3}[._]/.test(url)) return false;
+        if (/_\d{2,4}x\d{2,4}q\d+\.jpg/i.test(url)) return false;
+        if (/\/ae-us\/.*?(category|nav|menu|header|footer)/i.test(url)) return false;
+        // Keywords
+        if (/icon|sprite|logo|star|rating|arrow|button|banner|placeholder|avatar/i.test(url)) return false;
+        return true;
+      });
+
+      // Deduplicate by base URL (strip size suffixes + .avif wrappers)
+      const baseUrl = (u) => {
+        const m = u.match(/^(.*?\.(?:jpg|jpeg|png|webp))/i);
+        return (m ? m[1] : u).replace(/^\/\//, "https://").toLowerCase();
+      };
+      const seen = new Set();
+      const deduped = filtered.filter((url) => {
+        const key = baseUrl(url);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      return { images: deduped, variantMap };
+    });
+
+    return result;
+  } catch (err) {
+    console.log(`  Gallery scrape failed for ${productId}: ${err.message}`);
+    return { images: [], variantMap: {} };
+  }
 }
 
 async function mainSuggested() {
@@ -364,18 +488,11 @@ async function mainSuggested() {
   ensureDir(CANDIDATES_IMAGES_DIR);
 
   const db = getDb();
-  initSchema(db);
-
-  const insert = db.prepare(`
-    INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status)
-    VALUES (@title, @image_url, @image_path, 'suggested', @ali_product_id, @price, @product_url, 'new')
-  `);
+  await initSchema(db);
 
   // Get existing AliExpress product IDs to deduplicate
-  const existingIds = new Set(
-    db.prepare("SELECT ali_product_id FROM candidates WHERE ali_product_id IS NOT NULL").all()
-      .map((r) => r.ali_product_id)
-  );
+  const existingRows = await queryAll(db, "SELECT ali_product_id FROM candidates WHERE ali_product_id IS NOT NULL");
+  const existingIds = new Set(existingRows.map((r) => r.ali_product_id));
 
   let browser;
   try {
@@ -385,7 +502,6 @@ async function mainSuggested() {
   } catch (err) {
     console.error("Failed to connect to Chrome. Run ./start-chrome.sh first.");
     console.error(`Error: ${err.message}`);
-    db.close();
     process.exit(1);
   }
 
@@ -408,6 +524,10 @@ async function mainSuggested() {
     const debugHtml = await page.content();
     fs.writeFileSync(path.join(__dirname, "debug-suggested.html"), debugHtml);
     console.log("Saved debug-suggested.html for selector inspection.\n");
+
+    // Diagnostic: count card-out-wrapper elements before scraping
+    const cardCount = await page.$$eval('.card-out-wrapper', (els) => els.length);
+    console.log(`Selector diagnostic: .card-out-wrapper = ${cardCount} elements on page`);
 
     const products = await scrapeSuggestedProducts(page);
     console.log(`Found ${products.length} suggested products.\n`);
@@ -435,25 +555,33 @@ async function mainSuggested() {
         }
       }
 
-      insert.run({
-        title: p.title,
-        image_url: p.image_url,
-        image_path: imagePath,
-        ali_product_id: p.ali_product_id,
-        price: p.price,
-        product_url: p.product_url,
-      });
+      // Scrape full gallery from product page
+      let allImages = null;
+      let variantSpecifics = null;
+      if (p.product_url) {
+        const gallery = await scrapeProductGallery(page, p.product_url, p.ali_product_id);
+        if (gallery.images.length > 0) allImages = JSON.stringify(gallery.images);
+        if (Object.keys(gallery.variantMap).length > 0) variantSpecifics = JSON.stringify(gallery.variantMap);
+      }
+
+      const safePrice = (p.price != null && isFinite(p.price)) ? p.price : null;
+      await run(db,
+        "INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status, all_images, variant_specifics) VALUES (?, ?, ?, 'suggested', ?, ?, ?, 'new', ?, ?)",
+        [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url, allImages, variantSpecifics]
+      );
 
       if (p.ali_product_id) existingIds.add(p.ali_product_id);
       added++;
 
+      const galleryCount = allImages ? JSON.parse(allImages).length : 0;
       const shortTitle = p.title.substring(0, 55);
       const priceStr = p.price ? `$${p.price}` : "no price";
-      console.log(`  [${i + 1}/${products.length}] ${shortTitle}... — ${priceStr}`);
+      console.log(`  [${i + 1}/${products.length}] ${shortTitle}... — ${priceStr} (${galleryCount} gallery imgs)`);
     }
 
+    const countRow = await queryAll(db, "SELECT COUNT(*) as c FROM candidates");
     console.log(`\n=== Done! Added ${added} candidates, skipped ${skipped} duplicates ===`);
-    console.log(`Total candidates: ${db.prepare("SELECT COUNT(*) as c FROM candidates").get().c}`);
+    console.log(`Total candidates: ${countRow[0].c}`);
   } catch (err) {
     console.error("Error during scraping:", err.message);
     try {
@@ -463,7 +591,337 @@ async function mainSuggested() {
   } finally {
     await page.close();
     await browser.close();
-    db.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wishlist — scrape AliExpress saved/favorites items
+// ---------------------------------------------------------------------------
+
+// Extracts product cards from the AliExpress wishlist page (/p/wish-manage/).
+//
+// This page does NOT use <a href="/item/..."> links — navigation is JS-driven.
+// Product data is encoded in the DOM as follows:
+//   - Product ID:  data-id="operator_PRODUCTID" on the action-overlay div
+//   - Title:       <span class*="sideTitleText"> inside the card
+//   - Image:       CSS background-image on <div class*="pictureUrl">
+//   - Price:       textContent of <div class*="price--price"> (individual char spans)
+async function scrapeWishlistProducts(page) {
+  return page.evaluate(() => {
+    const results = [];
+    const seen = new Set();
+
+    // Each product card has an action overlay with data-id="operator_PRODUCTID".
+    // The operator div and the productCard are siblings inside the editItemWrap container.
+    document.querySelectorAll('[data-id^="operator_"]').forEach((operatorEl) => {
+      const dataId = operatorEl.getAttribute("data-id") || "";
+      const productId = dataId.replace("operator_", "");
+      if (!productId || !/^\d+$/.test(productId) || seen.has(productId)) return;
+      seen.add(productId);
+
+      const productUrl = `https://www.aliexpress.com/item/${productId}.html`;
+
+      // Climb to the shared editItemWrap container that holds both card and operator
+      const card = operatorEl.closest('[class*="editItemWrap"]') || operatorEl.parentElement;
+
+      // Title: span with class containing "sideTitleText"
+      const titleEl = card ? card.querySelector('[class*="sideTitleText"]') : null;
+      const title = titleEl ? titleEl.textContent.trim() : "";
+      if (!title || title.length < 5) return;
+
+      // Image: div with class containing "pictureUrl" uses CSS background-image
+      const picEl = card ? card.querySelector('[class*="pictureUrl"]') : null;
+      let imageUrl = null;
+      if (picEl) {
+        const style = picEl.getAttribute("style") || "";
+        const match = style.match(/url\(["']?(.*?)["']?\)/);
+        if (match) {
+          imageUrl = match[1];
+          if (imageUrl && imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+        }
+      }
+
+      // Price: AliExpress renders price as individual char spans — grab textContent from wrapper
+      const priceEl = card ? card.querySelector('[class*="price--price"]') : null;
+      let price = null;
+      if (priceEl) {
+        const raw = priceEl.textContent.replace(/[^0-9.]/g, "");
+        if (raw) {
+          const parsed = parseFloat(raw);
+          if (isFinite(parsed)) price = parsed;
+        }
+      }
+
+      results.push({ title, image_url: imageUrl, price, ali_product_id: productId, product_url: productUrl });
+    });
+
+    return results;
+  });
+}
+
+async function mainWishlist() {
+  console.log("=== IMMIGRANT Store — AliExpress Wishlist Scraper ===\n");
+  console.log("This scrapes your saved/favorites items from the AliExpress wishlist page.\n");
+  console.log("Make sure Chrome is running with ./start-chrome.sh and you're logged in.\n");
+
+  await waitForEnter("Press Enter when ready... ");
+
+  ensureDir(CANDIDATES_IMAGES_DIR);
+
+  const db = getDb();
+  await initSchema(db);
+
+  // Dedup against all existing candidates
+  const existingRows = await queryAll(db, "SELECT ali_product_id FROM candidates WHERE ali_product_id IS NOT NULL");
+  const existingIds = new Set(existingRows.map((r) => r.ali_product_id));
+
+  let browser;
+  try {
+    console.log(`Connecting to Chrome at ${CDP_ENDPOINT}...`);
+    browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+    console.log("Connected!\n");
+  } catch (err) {
+    console.error("Failed to connect to Chrome. Run ./start-chrome.sh first.");
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+
+  const context = browser.contexts()[0];
+  const page = await context.newPage();
+
+  try {
+    console.log(`Navigating to ${WISHLIST_URL}...`);
+    // Use networkidle: /p/wish-manage/ is a React SPA — domcontentloaded fires
+    // before product cards render. networkidle waits for JS to settle.
+    await page.goto(WISHLIST_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(4000);
+
+    // Login/redirect check
+    const currentUrl = page.url();
+    const pageTitle = await page.title().catch(() => "(no title)");
+    console.log("Page loaded.");
+    console.log("  Final URL:  ", currentUrl);
+    console.log("  Page title: ", pageTitle);
+
+    if (currentUrl.includes("login") || currentUrl.includes("passport") || currentUrl.includes("sign")) {
+      console.log("\nRedirected to login — not logged in or session expired.");
+      console.log("Log in to AliExpress in Chrome then run again.");
+      await page.close();
+      await browser.close();
+      process.exit(1);
+    }
+
+    // --- Pre-scroll diagnostic: sample anchor hrefs and find scroll container ---
+    const preDiag = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll("a[href]"));
+      const sampleHrefs = anchors.slice(0, 20).map(a => a.href);
+
+      // Find scrollable containers (overflowY auto/scroll, scrollHeight > clientHeight)
+      const scrollable = [];
+      document.querySelectorAll("div, section, ul, main").forEach(el => {
+        const oy = window.getComputedStyle(el).overflowY;
+        if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 50) {
+          scrollable.push({
+            tag: el.tagName,
+            id: el.id || null,
+            cls: (el.className || "").substring(0, 100),
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+          });
+        }
+      });
+
+      return { sampleHrefs, scrollable: scrollable.slice(0, 10) };
+    });
+    console.log("Sample hrefs (pre-scroll):", JSON.stringify(preDiag.sampleHrefs, null, 2));
+    console.log("Scrollable containers:", JSON.stringify(preDiag.scrollable, null, 2));
+
+    // --- Scroll inner container to trigger virtual list rendering ---
+    // AliExpress /p/wish-manage/ uses an inner scrollable div, not window scroll.
+    // Find it by overflow style; fall back to window if nothing found.
+    console.log("Scrolling wishlist container...");
+    for (let i = 0; i < 8; i++) {
+      await page.evaluate(() => {
+        // Try known wish/manage/list selectors first
+        const selectors = [
+          '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
+          '[class*="manage-list"]', '[class*="manageList"]',
+          '[class*="item-list"]', '[class*="itemList"]',
+          '[class*="product-list"]', '[class*="productList"]',
+          '[class*="scroll"]', '[class*="list-wrap"]',
+        ];
+        let container = null;
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el && el.scrollHeight > el.clientHeight + 100) { container = el; break; }
+        }
+        // Fallback: tallest overflow-scroll div on the page
+        if (!container) {
+          let bestH = 0;
+          document.querySelectorAll("div, section, ul").forEach(el => {
+            const oy = window.getComputedStyle(el).overflowY;
+            if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
+              bestH = el.scrollHeight;
+              container = el;
+            }
+          });
+        }
+        if (container) {
+          container.scrollTop += container.clientHeight;
+        } else {
+          window.scrollBy(0, window.innerHeight);
+        }
+      });
+      await page.waitForTimeout(1500);
+    }
+    // Scroll back to top so we capture items from the beginning
+    await page.evaluate(() => {
+      const selectors = [
+        '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
+        '[class*="manage-list"]', '[class*="manageList"]',
+        '[class*="item-list"]', '[class*="itemList"]',
+        '[class*="scroll"]',
+      ];
+      let container = null;
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.scrollHeight > el.clientHeight + 100) { container = el; break; }
+      }
+      if (!container) {
+        let bestH = 0;
+        document.querySelectorAll("div, section, ul").forEach(el => {
+          const oy = window.getComputedStyle(el).overflowY;
+          if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
+            bestH = el.scrollHeight; container = el;
+          }
+        });
+      }
+      if (container) container.scrollTop = 0;
+      else window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(1500);
+
+    // Scroll back down slowly so virtual list renders all items top-to-bottom
+    console.log("Re-scrolling top-to-bottom to render all virtual list items...");
+    for (let i = 0; i < 8; i++) {
+      await page.evaluate(() => {
+        let container = null;
+        let bestH = 0;
+        document.querySelectorAll("div, section, ul").forEach(el => {
+          const oy = window.getComputedStyle(el).overflowY;
+          if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
+            bestH = el.scrollHeight; container = el;
+          }
+        });
+        if (container) container.scrollTop += container.clientHeight * 0.8;
+        else window.scrollBy(0, window.innerHeight * 0.8);
+      });
+      await page.waitForTimeout(1500);
+    }
+    await page.waitForTimeout(1000);
+
+    // Save debug HTML for selector inspection
+    const debugHtml = await page.content();
+    fs.writeFileSync(path.join(__dirname, "debug-wishlist.html"), debugHtml);
+    console.log("Saved debug-wishlist.html for selector inspection.\n");
+
+    // Diagnostics
+    const diag = await page.evaluate(() => {
+      const operatorEls = Array.from(document.querySelectorAll('[data-id^="operator_"]'));
+      return {
+        // Primary signal — wishlist uses data-id="operator_PRODUCTID", not <a href>
+        operatorCards:   operatorEls.length,
+        sampleProductIds: operatorEls.slice(0, 5).map(el => el.getAttribute("data-id").replace("operator_", "")),
+        // Secondary signals
+        infiniteScroll:  document.querySelectorAll('[class*="infinite-scroll"]').length,
+        editItemWraps:   document.querySelectorAll('[class*="editItemWrap"]').length,
+        allImgs:         document.querySelectorAll("img").length,
+        allAnchors:      document.querySelectorAll("a[href]").length,
+        // Legacy — expected to be 0 on wish-manage page
+        itemLinks:       document.querySelectorAll('a[href*="/item/"]').length,
+      };
+    });
+    console.log("Selector diagnostics:", JSON.stringify(diag, null, 2));
+
+    if (diag.operatorCards === 0) {
+      console.log("\nNo operator_ product cards found on page.");
+      console.log("  Wishlist may be empty, or AliExpress changed the DOM structure.");
+      console.log("  Check debug-wishlist.html and look for '[data-id^=operator_]' elements.");
+      await page.close();
+      await browser.close();
+      return;
+    }
+
+    const products = await scrapeWishlistProducts(page);
+    console.log(`Found ${products.length} wishlist products.\n`);
+
+    if (products.length === 0) {
+      console.log("Product extraction returned 0 items despite item links present.");
+      console.log("Check debug-wishlist.html — title or card detection may need adjustment.");
+      await page.close();
+      await browser.close();
+      return;
+    }
+
+    let added = 0;
+    let skipped = 0;
+
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i];
+
+      if (p.ali_product_id && existingIds.has(p.ali_product_id)) {
+        skipped++;
+        console.log(`  [${i + 1}/${products.length}] SKIP (already in DB): ${p.title.substring(0, 55)}...`);
+        continue;
+      }
+
+      let imagePath = null;
+      if (p.image_url) {
+        const filename = `wishlist_${sanitizeFilename(p.title)}_${Date.now()}.jpg`;
+        const dest = path.join(CANDIDATES_IMAGES_DIR, filename);
+        try {
+          await downloadImage(p.image_url, dest);
+          imagePath = path.relative(__dirname, dest);
+        } catch (_) {}
+      }
+
+      // Gallery scrape — same path as suggested
+      let allImages = null;
+      let variantSpecifics = null;
+      if (p.product_url) {
+        const gallery = await scrapeProductGallery(page, p.product_url, p.ali_product_id);
+        if (gallery.images.length > 0) allImages = JSON.stringify(gallery.images);
+        if (Object.keys(gallery.variantMap).length > 0) variantSpecifics = JSON.stringify(gallery.variantMap);
+      }
+
+      const safePrice = (p.price != null && isFinite(p.price)) ? p.price : null;
+      await run(db,
+        "INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status, stage, all_images, variant_specifics) VALUES (?, ?, ?, 'wishlist', ?, ?, ?, 'new', 'intake', ?, ?)",
+        [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url, allImages, variantSpecifics]
+      );
+
+      if (p.ali_product_id) existingIds.add(p.ali_product_id);
+      added++;
+
+      const galleryCount = allImages ? JSON.parse(allImages).length : 0;
+      const shortTitle = p.title.substring(0, 55);
+      const priceStr = p.price ? `$${p.price}` : "no price";
+      console.log(`  [${i + 1}/${products.length}] ${shortTitle}... — ${priceStr} (${galleryCount} gallery imgs)`);
+    }
+
+    const countRow = await queryAll(db, "SELECT COUNT(*) as c FROM candidates");
+    console.log(`\n=== Done! Added ${added} wishlist candidates, skipped ${skipped} duplicates ===`);
+    console.log(`Total candidates: ${countRow[0].c}`);
+  } catch (err) {
+    console.error("Error during scraping:", err.message);
+    try {
+      const html = await page.content();
+      fs.writeFileSync(path.join(__dirname, "debug-wishlist.html"), html);
+      console.log("Saved debug-wishlist.html for inspection.");
+    } catch (_) {}
+  } finally {
+    await page.close();
+    await browser.close();
   }
 }
 
@@ -474,6 +932,8 @@ async function mainSuggested() {
 const mode = process.argv[2];
 if (mode === "suggested") {
   mainSuggested();
+} else if (mode === "wishlist") {
+  mainWishlist();
 } else {
   main();
 }

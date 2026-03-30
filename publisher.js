@@ -182,70 +182,72 @@ async function publishCandidate(candidateId, db) {
   const ownDb = !db;
   if (!db) {
     db = getDb();
-    initSchema(db);
+    await initSchema(db);
   }
 
-  const candidate = db.prepare("SELECT * FROM candidates WHERE id = ?").get(candidateId);
+  const { queryOne, run } = require("./db");
+
+  const candidate = await queryOne(db, "SELECT * FROM candidates WHERE id = ?", [candidateId]);
   if (!candidate) throw new Error(`Candidate ${candidateId} not found`);
-  if (!candidate.immigrant_name) throw new Error(`Candidate ${candidateId} not named yet`);
-  if (!candidate.retail_price) throw new Error(`Candidate ${candidateId} not priced yet`);
 
-  // Generate description
-  let aesthetic = "minimal";
-  try {
-    const bd = JSON.parse(candidate.score_breakdown || "{}");
-    aesthetic = bd.aesthetic?.value || "minimal";
-  } catch (_) {}
+  // Use edited name, or immigrant_name, or title
+  const productTitle = candidate.edited_name || candidate.immigrant_name || candidate.title;
+  if (!productTitle) throw new Error(`Candidate ${candidateId} has no name`);
 
-  const description = await generateDescription(candidate.immigrant_name, aesthetic);
+  // Use edited price, or retail_price, or raw price
+  const productPrice = candidate.edited_price || candidate.retail_price || candidate.price;
 
-  // Build variants from namer data
-  const variants = [];
-  let namerData = {};
-  try { namerData = JSON.parse(candidate.namer_data || "{}"); } catch (_) {}
-
-  const sizes = ["XS", "S", "M", "L", "XL"];
-  for (const size of sizes) {
-    variants.push({
-      option1: size,
-      price: String(candidate.retail_price),
-      requires_shipping: true,
-    });
+  // Generate description if not already edited
+  let description = candidate.edited_description || candidate.immigrant_description;
+  if (!description) {
+    let aesthetic = "minimal";
+    try { aesthetic = JSON.parse(candidate.score_breakdown || "{}").aesthetic?.value || "minimal"; } catch (_) {}
+    description = await generateDescription(productTitle, aesthetic);
   }
 
-  // Build images array
+  // Build variants
+  let sizes = ["XS", "S", "M", "L", "XL"];
+  try { const parsed = JSON.parse(candidate.edited_sizes || "[]"); if (parsed.length > 0) sizes = parsed; } catch (_) {}
+
+  const variants = sizes.map((size) => ({
+    option1: size,
+    price: String(productPrice || 0),
+    requires_shipping: true,
+  }));
+
+  // Build images — CRITICAL: use processed_image_url (Ghost Logic) as primary
   const images = [];
-  const processedImages = db
-    .prepare("SELECT * FROM image_processing WHERE candidate_id = ? AND hidden = 0 ORDER BY sort_order")
-    .all(candidateId);
 
-  for (const img of processedImages) {
-    if (img.processed_path) {
-      const fullPath = path.resolve(__dirname, img.processed_path);
-      if (fs.existsSync(fullPath)) {
-        const data = fs.readFileSync(fullPath);
-        images.push({ attachment: data.toString("base64") });
-      }
-    }
+  // Priority 1: Ghost Logic processed image URL
+  if (candidate.processed_image_url) {
+    images.push({ src: candidate.processed_image_url });
   }
-
-  // If no processed images, use original
-  if (images.length === 0 && candidate.image_path) {
+  // Priority 2: AliExpress CDN image URL
+  else if (candidate.image_url) {
+    let url = candidate.image_url;
+    if (url.startsWith("//")) url = "https:" + url;
+    // Strip avif to get renderable image
+    const jpgMatch = url.match(/^(.*?\.(?:jpg|jpeg|png))/i);
+    images.push({ src: jpgMatch ? jpgMatch[1] : url.replace(/_?\.avif$/i, "") });
+  }
+  // Priority 3: Local file (only works on local dev)
+  else if (candidate.image_path) {
     const fullPath = path.resolve(__dirname, candidate.image_path);
     if (fs.existsSync(fullPath)) {
-      const data = fs.readFileSync(fullPath);
-      images.push({ attachment: data.toString("base64") });
+      images.push({ attachment: fs.readFileSync(fullPath).toString("base64") });
     }
   }
+
+  // Determine category for collections
+  const category = candidate.detected_category || "tops";
 
   // Create Shopify product
   const productData = {
     product: {
-      title: candidate.immigrant_name,
+      title: productTitle,
       body_html: `<p>${description}</p>`,
       vendor: "IMMIGRANT",
-      product_type: aesthetic,
-      tags: (namerData.suggested_tags || []).join(", "),
+      product_type: category,
       options: [{ name: "Size", values: sizes }],
       variants,
       images,
@@ -254,17 +256,16 @@ async function publishCandidate(candidateId, db) {
 
   const result = await shopifyRequest("/products.json", "POST", productData);
   const shopifyProductId = result.product.id;
+  const shopifyHandle = result.product.handle;
+  const shopifyUrl = `https://${SHOPIFY_STORE}/products/${shopifyHandle}`;
 
-  // Assign to collections based on gender + garment type
-  const garmentType = aesthetic; // from score_breakdown
-  const collectionNames = getCollectionNames(candidate.gender, garmentType);
+  // Assign to collections based on gender + category
+  const collectionNames = getCollectionNames(candidate.gender, category);
   await addToCollections(shopifyProductId, collectionNames);
 
-  // Update database
-  db.prepare("UPDATE candidates SET shopify_product_id = ?, immigrant_description = ?, status = 'published' WHERE id = ?").run(
-    String(shopifyProductId),
-    description,
-    candidateId
+  // Update database via async Turso API
+  await run(db, "UPDATE candidates SET shopify_product_id = ?, shopify_url = ?, immigrant_description = ?, status = 'published' WHERE id = ?",
+    [String(shopifyProductId), shopifyUrl, description, candidateId]
   );
 
   // Rate limit: Shopify allows ~2 req/sec
@@ -277,15 +278,15 @@ async function publishCandidate(candidateId, db) {
 // Publish all ready candidates
 async function publishAll() {
   const db = getDb();
-  initSchema(db);
+  await initSchema(db);
 
-  const candidates = db.prepare(`
-    SELECT id, immigrant_name FROM candidates
-    WHERE status = 'approved'
-    AND immigrant_name IS NOT NULL
-    AND retail_price IS NOT NULL
+  const { queryAll } = require("./db");
+  const candidates = await queryAll(db, `
+    SELECT id, edited_name, immigrant_name FROM candidates
+    WHERE status IN ('approved', 'launch_bucket')
+    AND (edited_name IS NOT NULL OR immigrant_name IS NOT NULL)
     AND shopify_product_id IS NULL
-  `).all();
+  `);
 
   console.log(`=== Publishing ${candidates.length} products to Shopify ===\n`);
 

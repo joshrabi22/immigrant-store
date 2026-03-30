@@ -1,9 +1,10 @@
 // Get the best image URL for a candidate
 // On Railway: image_path files don't exist, so use AliExpress CDN (image_url)
-// Locally: image_path files exist and load faster than CDN
+// Locally: image_path files exist and load faster + avoid CDN hotlink blocks
 //
-// Strategy: if image_url exists, use CDN (works everywhere).
-// Fall back to local path only if no image_url.
+// Strategy: prefer local image_path (served via /images/ static route) when
+// available — AliExpress CDN hotlink-protects images loaded from localhost.
+// Fall back to CDN URL only when no local file exists (Railway deployment).
 
 function cleanAliUrl(url) {
   if (!url) return null;
@@ -14,15 +15,15 @@ function cleanAliUrl(url) {
 }
 
 export default function imgUrl(item, bustCache) {
-  // Prefer CDN URL — works on both Railway and local
-  if (item.image_url) {
-    return cleanAliUrl(item.image_url);
-  }
-
-  // Fall back to local path (only works on local dev)
+  // Prefer local path — served by express.static('/images'), avoids CDN hotlink blocks
   if (item.image_path) {
     const local = `/images/${item.image_path.replace("images/", "")}`;
     return bustCache ? `${local}?t=${Date.now()}` : local;
+  }
+
+  // Fall back to CDN URL (Railway deployment where local files don't exist)
+  if (item.image_url) {
+    return cleanAliUrl(item.image_url);
   }
 
   return null;

@@ -29,36 +29,48 @@ Phase 1 (taste profiling) and Phase 2 (sourcing, curation, publishing) are compl
   - 3-layer junk filter: title keywords → red banner pixel detection → Claude vision product check
   - Claude vision gender detection (mens/womens/unisex) on every product
   - Multi-format image URL fallback (.jpg, .webp, .png, strip avif/size suffixes)
+  - Full gallery + SKU variant map scraping (imagePathList, skuPropertyImagePath, skuPropIds → sizes)
   - 30-60s random delay between cycles
 - `cj.js` — CJ Dropshipping API sourcer (keyword search from taste profile)
 - `scraper.js` — AliExpress order history scraper (CDP) + suggested mode
 
-**Curation Flow: SWIPE → MY PICKS → EDIT SUITE → LIVE**
+**Curation Flow: SWIPE → MY PICKS → GHOST LOGIC → PHOTO SUITE → LAUNCH → LIVE**
 
-- **SWIPE tab** — one card at a time, Y/N keys or swipe gestures
-  - Gender filter buttons (ALL / M / W / U)
-  - Tappable gender badge (M/W/U) + category badge (TOP/BTM/OUT/FTW/JWL/BLT/ACC)
-  - Undo (Z key, up to 10 steps)
-  - Live queue count updates every 5s as alistream adds products
-  - Batches of 100
+- **SWIPE tab** — Tinder-style Y/N cards with gender filter (M/W/U), undo (Z), category badges
+  - Approve auto-triggers Ghost Logic (BullMQ queue)
 
-- **MY PICKS tab** — masonry grid of approved products
-  - Status dots: grey (saved), sand (edited), black (live)
-  - "Start Editing (N unedited)" button
-  - Click any card to open in Edit Suite
+- **MY PICKS tab** — FoundCo-style 3-column grid (40px gap, 4:5 aspect)
+  - ✦ Ghost Edit button on every card → opens Deep Edit drawer for single item
+  - Checkboxes for multi-select + "batch process selected" button
+  - "start photo suite" button for full swipe review
+  - Green "AI" badge on processed items. Items with `processing_status='processing'` hidden.
+  - × remove button on every card
 
-- **EDIT SUITE** — full-screen per-product editor (launched from My Picks)
-  - Queue / Skipped internal tabs with progress bar
-  - **Photo editor:** Remove BG (remove.bg API), Auto-enhance (6-step Sharp.js pipeline: warm tone, contrast, desaturate, sharpen, crop 800x1000), before/after comparison, revert to original
-  - **Name:** Claude vision auto-generates 2-3 word minimal names + creative color names. Cormorant Garamond display. Regenerate button. Saves on blur.
-  - **Description:** Claude auto-generates in brand voice (Celine/Acne Studios/A.P.C. style, 1-3 sentences, no marketing language). Regenerate button. Character count.
-  - **Details:** Category dropdown (7 options), gender M/W/U toggle, price field with cost calc, editable color names, size toggles XS-XL
-  - **Actions:** Skip for Now (saves + moves to skipped) | Publish to Shopify (immediate, auto-advances)
-  - Skipped tab: grid with Resume / Remove buttons
+- **Deep Edit Drawer** — bottom sheet (Framer Motion + AnimatePresence)
+  - @dnd-kit sortable photo gallery grid (drag to reorder, first = hero)
+  - × delete button on every thumbnail (persists to Turso)
+  - ⑂ purple SKU Split button (two-tap: tap 1 = arm green, tap 2 = execute, auto-disarm 3s)
+    - Creates child listing with variant_specifics JSON for fulfillment routing
+    - Removes split image from parent gallery in both UI and Turso
+    - Green toast: "split into new listing"
+  - "Fetch Gallery" button when gallery empty (rescrapes AliExpress product page)
+  - "Process Curated Gallery" button → queues Ghost Logic, item disappears from Picks
+  - Name editor (Cormorant Garamond, lowercase), auto-regen description, price with roundTo80, category dropdown
 
-- **LIVE tab** — all published products
-  - Green live dot, price, "View on store" link
-  - Unpublish button (pulls from Shopify, resets to editing)
+- **Ghost Logic Pipeline** (auto or manual, background worker)
+  - Stage 1: Extraction (Photoroom / remove.bg → Cloudinary upload)
+  - Stage 2: Compositing (Gemini 3 Flash — studio lighting, contact shadow, #F5F2ED)
+  - Stage 3: Naming (Claude — 2-word lowercase, bone/slate/moss palette + 1-sentence description)
+  - Results → Turso: processed_image_url, edited_name, edited_description, processing_status='ready'
+
+- **Photo Suite** — Framer Motion card stack (only items where processing_status='ready')
+  - Swipe right → launch bucket, swipe left → reject, tap → Deep Edit
+  - Peek cards, swipe indicators, stats counter
+
+- **Launch Bucket** — FoundCo grid, "publish all to shopify" button, individual publish on hover, progress bar
+  - Published items get grey "LIVE" badge, move to Live tab
+
+- **LIVE tab** — published products grid with "view on store" + unpublish
 
 **Publishing:**
 - `publisher.js` — Shopify Admin REST API, brand-voice descriptions, variant setup
@@ -90,14 +102,47 @@ Phase 1 (taste profiling) and Phase 2 (sourcing, curation, publishing) are compl
 - Server starts BEFORE database connects — healthcheck `/api/stats` returns 200 with zeros while DB initializes
 - `/api/health` endpoint for debugging — always returns 200 with `dbReady` status
 
-### Known issues
-- Sharp.js not available on Railway (native binary) — image enhancement disabled on cloud, works locally
-- Image files are local-only — Railway serves images via AliExpress CDN URLs (imgUrl.js fallback)
+### Deployment status (2026-03-24)
+- **Railway web service:** LIVE — server starts, healthcheck passes, Turso connected, 665 candidates confirmed
+- **Railway worker (alistream.js):** Running 24/7, headless Playwright
+- **Turso database:** Connected with fresh credentials, 665 candidates (495 new, 29 approved, 141 rejected)
+- **curate.22immigrant.com:** DNS configured at Namecheap, still propagating
+- **All env vars:** Set correctly in Railway (TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, ANTHROPIC_API_KEY, SHOPIFY_*, CJ_*, REMOVEBG_API_KEY)
+- **DSers:** Installed and linked to Shopify for AliExpress fulfillment
+
+**Ghost Logic Pipeline (activated 2026-03-24):**
+- 3-stage image processing: Extraction (Photoroom/remove.bg) → Compositing (Gemini 3 Flash) → Naming/Copy (Claude)
+- All processed images uploaded to Cloudinary CDN (`server/lib/cloudinary.js`)
+- Auto-triggered on swipe approve — BullMQ queues job, worker processes async
+- Direct mode for testing: `node server/workers/ghostLogicWorker.js --direct <id>`
+- Claude generates 2-word lowercase names (bone/slate/moss palette) + 1-sentence unbothered descriptions
+- Results saved to Turso: `processed_image_url`, `edited_name`, `edited_description`, `processing_status`
+
+**Photo Suite (replaces Edit Suite):**
+- Tinder-style card stack (Framer Motion) for reviewing Ghost Logic processed items
+- Swipe right → launch bucket, swipe left → reject, tap → Deep Edit drawer
+- Deep Edit: @dnd-kit sortable photo grid, name editor (Cormorant Garamond), auto-regen description, price with roundTo80, category dropdown
+- Launch Bucket: 3-column FoundCo grid (40px gap, 4:5 aspect, hover scale 1.02x), publish all to Shopify
+
+**UI Design (FoundCo aesthetic):**
+- Header: IMMIGRANT logo (Cormorant Garamond, 1.8rem, letter-spacing 0.4em) + nav (SWIPE/PICKS/LAUNCH/LIVE at 11px)
+- Product grids: 3 columns, 40px gap, 4:5 portrait, left-aligned name + price below image
+- Names: Cormorant Garamond 300, 1.1rem, lowercase
+- Prices: Helvetica Neue 400, 0.9rem, #6B6B6B
+- Hover: subtle 1.02x scale, action buttons revealed on hover only
+
+### Deployment status (2026-03-24)
+- **Railway web service:** LIVE
+- **Railway worker:** LIVE (alistream.js 24/7)
+- **Turso database:** 665 candidates, fresh read-write token
+- **Cloudinary:** Needs CLOUDINARY_URL in .env
+- **curate.22immigrant.com:** DNS configured
 
 ### What's next
-- Test full swipe → edit → publish flow on Railway
-- Instagram content automation (Phase 3/4)
-- Shopify theme deployment via `shopify theme push`
+- Add CLOUDINARY_URL + GEMINI_API_KEY to activate full Ghost Logic pipeline
+- Test end-to-end: swipe → Ghost Logic → Photo Suite → Launch Bucket → Shopify
+- Instagram content automation
+- Shopify theme push
 
 ## Taste profile findings
 
@@ -141,18 +186,26 @@ cj.js                — CJ Dropshipping API sourcer
 
 # Processing
 scorer.js            — Taste profile scoring engine
-namer.js             — AI brand name generator
+namer.js             — AI brand name generator (2-3 words, lowercase, bone/slate/moss palette)
 pricer.js            — Category-aware pricing engine
-images.js            — Image processor (remove.bg + sharp)
+images.js            — Ghost Logic image pipeline (Photoroom → Gemini → Claid.ai)
 cleanup.js           — Candidate cleanup (re-filter existing data)
 
+# Ghost Logic pipeline
+server/workers/ghostLogicWorker.js — 3-stage pipeline (extraction → compositing → naming)
+server/lib/cloudinary.js           — Cloudinary upload helper
+
 # Server & UI
-server.js            — Express API (20+ endpoints)
-client/              — React + Vite (SWIPE / MY PICKS / EDIT SUITE / LIVE)
-client/src/imgUrl.js — Image URL helper (local path → CDN fallback)
+server.js            — Express API (30+ endpoints, Photo Suite, Launch Bucket, Ghost Logic queue)
+client/              — React + Vite + Framer Motion + dnd-kit
+client/src/imgUrl.js — Image URL helper (CDN-first, local fallback)
+client/src/components/PhotoSuite.jsx    — Tinder-style card review (Framer Motion)
+client/src/components/DeepEditDrawer.jsx — Bottom sheet editor (dnd-kit sortable photos)
+client/src/components/LaunchBucket.jsx   — FoundCo-style publish grid
+client/src/components/LiveTab.jsx        — Published products grid
 
 # Publishing
-publisher.js         — Shopify product publisher (18 collections)
+publisher.js         — Shopify publisher (processed_image_url → Shopify, 18 collections)
 monitor.js           — Dead listing monitor
 
 # Theme
@@ -162,7 +215,7 @@ theme/               — Shopify Liquid storefront theme
 Dockerfile           — Railway web service
 Dockerfile.worker    — Railway alistream worker
 railway.toml         — Railway build config
-DEPLOY.md            — Step-by-step deployment guide
+DEPLOY.md            — Deployment guide
 
 # Shared libs
 lib/taste.js         — Taste profile loader + search keywords
@@ -188,7 +241,12 @@ SHOPIFY_ACCESS_TOKEN       — Shopify Admin access
 SHOPIFY_STORE_URL          — 22immigrant.myshopify.com
 CJ_API_KEY                 — CJ Dropshipping
 CJ_API_EMAIL               — CJ account email
-REMOVEBG_API_KEY           — remove.bg background removal
+PHOTOROOM_API_KEY          — Photoroom background removal (Ghost Logic Stage 1)
+REMOVEBG_API_KEY           — remove.bg (Stage 1 fallback)
+GEMINI_API_KEY             — Gemini 3 Flash compositing (Ghost Logic Stage 2)
+CLAID_API_KEY              — Claid.ai texture sharpening (future)
+CLOUDINARY_URL             — Cloudinary image hosting (Ghost Logic output)
+REDIS_URL                  — BullMQ queue (Ghost Logic auto-processing)
 PORT                       — Server port (default 3000)
 RAILWAY_ENVIRONMENT        — Set by Railway (triggers cloud mode)
 ```

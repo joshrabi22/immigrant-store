@@ -226,10 +226,135 @@ const STRATEGIES = [cycleHomepage, cycleMensCategory, cycleWomensCategory, cycle
 const STRATEGY_NAMES = ["Homepage", "Men's", "Women's", "Unisex", "Search", "Accessories"];
 
 // ---------------------------------------------------------------------------
+// Gallery scraper — visits product page to extract all images + color variants
+// ---------------------------------------------------------------------------
+
+async function scrapeProductGallery(page, productUrl, candidateId) {
+  try {
+    await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForTimeout(2000);
+
+    const result = await page.evaluate(() => {
+      const images = new Set();
+      const variantMap = {}; // image_url → { propertyId, propertyName, sizes[] }
+
+      // Method 1: DOM images
+      document.querySelectorAll(
+        'img[src*="alicdn"], img[data-src*="alicdn"], img[src*="ae-pic"], img[data-src*="ae-pic"]'
+      ).forEach((img) => {
+        const src = img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src");
+        if (src && (src.includes("alicdn") || src.includes("ae-pic"))) images.add(src);
+      });
+
+      // Method 2: SKU variant thumbnails from DOM
+      document.querySelectorAll(
+        '[class*="sku"] img, [class*="variant"] img, [class*="color"] img, [class*="Sku"] img'
+      ).forEach((img) => {
+        const src = img.src || img.getAttribute("data-src");
+        if (src) images.add(src);
+      });
+
+      // Method 3: Parse embedded JSON for imageModule + skuModule
+      const scripts = document.querySelectorAll("script");
+      for (const script of scripts) {
+        const text = script.textContent || "";
+
+        // imagePathList
+        const imgListMatch = text.match(/"imagePathList"\s*:\s*\[(.*?)\]/);
+        if (imgListMatch) {
+          const urls = imgListMatch[1].match(/"(https?:\/\/[^"]+)"/g);
+          if (urls) urls.forEach((u) => images.add(u.replace(/"/g, "")));
+        }
+
+        // skuModule — extract variant → image mapping
+        // Pattern: "skuPropertyId":"14:193","skuPropertyName":"Color","skuPropertyImagePath":"https://..."
+        const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
+        for (const m of skuBlocks) {
+          const [_, propId, propName, imgUrl] = m;
+          images.add(imgUrl);
+          variantMap[imgUrl] = { propertyId: propId, propertyName: propName, sizes: [] };
+        }
+
+        // Also try the reverse order pattern
+        const skuBlocks2 = text.matchAll(/"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"[^}]*?"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"/g);
+        for (const m of skuBlocks2) {
+          const [_, imgUrl, propId, propName] = m;
+          images.add(imgUrl);
+          if (!variantMap[imgUrl]) variantMap[imgUrl] = { propertyId: propId, propertyName: propName, sizes: [] };
+        }
+
+        // Extract available sizes per variant from priceList/skuList
+        // Pattern: "skuPropIds":"14:193#5:361386" where second part is size
+        const skuPrices = text.matchAll(/"skuPropIds"\s*:\s*"([^"]+)"/g);
+        for (const m of skuPrices) {
+          const propIds = m[1]; // e.g. "14:193#5:361386"
+          const parts = propIds.split("#");
+          const colorPart = parts[0]; // e.g. "14:193"
+          // Find which variant image this belongs to
+          for (const [imgUrl, data] of Object.entries(variantMap)) {
+            if (data.propertyId === colorPart && parts[1]) {
+              data.sizes.push(parts[1]);
+            }
+          }
+        }
+      }
+
+      // Known AliExpress page-chrome file hashes (service badges, trust icons,
+      // shipping graphics). Appear across 5-145 different products.
+      const PAGE_CHROME = new Set([
+        "Sa976459fb7724bf1bca6e153a425a8ebg","S9e723ca0d10848499e4e3fb33be2224do",
+        "S64c04957a1244dffbab7086d6e1a7cad7","Sb100bd23552d499c9fa8e1499f3c46dbw",
+        "S5c3261cf46fb47aa8c7f3abbdd792574S","Saf2ebe3af38947179531973d0d08ef74Y",
+        "Sd8c759485ca2404d87d8f5d5ed0d98e0K","S16183c3f12904fbbaf3f8aef523f0b73T",
+        "S9bad0c7ed77b4899ae22645df613a766r","Sa42ea28366094829a2e882420e1e269aJ",
+        "S3f91b770226a464c8baf581b22e148f7Y","S5fde9fa3ffdb45cf908380fcc49bf6771",
+        "Sa3e67595f2374efa9ce9f91574dc4650T",
+      ]);
+      const extractHash = (u) => { const m = u.match(/\/kf\/([A-Za-z0-9_]+)/); return m ? m[1] : null; };
+
+      // Multi-layer filter: fingerprints + structural patterns + keywords
+      const filtered = [...images].filter((url) => {
+        if (!url || typeof url !== "string") return false;
+        if (url.length < 30 || url.startsWith("data:")) return false;
+        if (!url.includes("alicdn.com") && !url.includes("aliexpress-media.com")) return false;
+        const h = extractHash(url);
+        if (h && PAGE_CHROME.has(h)) return false;
+        if (/\/\d{1,3}x\d{1,3}\.(?:png|jpg|gif)/i.test(url)) return false;
+        if (/_\d{1,3}x\d{1,3}[._]/.test(url)) return false;
+        if (/_\d{2,4}x\d{2,4}q\d+\.jpg/i.test(url)) return false;
+        if (/\/ae-us\/.*?(category|nav|menu|header|footer)/i.test(url)) return false;
+        if (/icon|sprite|logo|star|rating|arrow|button|banner|placeholder|avatar/i.test(url)) return false;
+        return true;
+      });
+
+      // Deduplicate by base URL (strip size suffixes + .avif wrappers)
+      const baseUrl = (u) => {
+        const m = u.match(/^(.*?\.(?:jpg|jpeg|png|webp))/i);
+        return (m ? m[1] : u).replace(/^\/\//, "https://").toLowerCase();
+      };
+      const seen = new Set();
+      const deduped = filtered.filter((url) => {
+        const key = baseUrl(url);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      return { images: deduped, variantMap };
+    });
+
+    return result;
+  } catch (err) {
+    console.log(`  Gallery scrape failed for ${candidateId}: ${err.message}`);
+    return { images: [], variantMap: {} };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Filter and save — async DB
 // ---------------------------------------------------------------------------
 
-async function filterAndSave(products, db, existingIds, client, model) {
+async function filterAndSave(products, db, existingIds, client, model, page) {
   let added = 0, filtered = 0, dupes = 0;
 
   for (const p of products) {
@@ -300,11 +425,24 @@ async function filterAndSave(products, db, existingIds, client, model) {
       }
     }
 
+    // Scrape full gallery if we have a product URL and a page reference
+    let allImages = null;
+    let variantSpecifics = null;
+    if (page && p.product_url) {
+      const galleryResult = await scrapeProductGallery(page, p.product_url, p.ali_product_id);
+      if (galleryResult.images.length > 0) {
+        allImages = JSON.stringify(galleryResult.images);
+      }
+      if (Object.keys(galleryResult.variantMap).length > 0) {
+        variantSpecifics = JSON.stringify(galleryResult.variantMap);
+      }
+    }
+
     // Save to database (async)
     try {
       await run(db,
-        "INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status, gender) VALUES (?, ?, ?, 'aliexpress', ?, ?, ?, 'new', ?)",
-        [p.title, p.image_url, imagePath, p.ali_product_id, p.price, p.product_url, gender]
+        "INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status, gender, all_images, variant_specifics) VALUES (?, ?, ?, 'aliexpress', ?, ?, ?, 'new', ?, ?, ?)",
+        [p.title, p.image_url, imagePath, p.ali_product_id, p.price, p.product_url, gender, allImages, variantSpecifics]
       );
       added++;
       existingIds.add(p.ali_product_id);
@@ -413,7 +551,7 @@ async function main() {
       }
 
       if (products.length > 0) {
-        const result = await filterAndSave(products, db, existingIds, client, model);
+        const result = await filterAndSave(products, db, existingIds, client, model, page);
         totalAdded += result.added;
         totalFiltered += result.filtered;
 
