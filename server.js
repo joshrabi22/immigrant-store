@@ -603,6 +603,15 @@ app.get("/api/staging/:id/variants", requireDb, async (req, res) => {
             return parts.filter((p) => p !== groupKey).join(",");
           }).filter(Boolean);
 
+          // Use live per-color size availability when present
+          const colorSizeData = variantData.colorSizes?.[groupKey];
+          const liveSizes = colorSizeData
+            ? { available: colorSizeData.available, soldOut: colorSizeData.soldOut }
+            : null;
+
+          // Use per-color price when present
+          const colorPrice = variantData.colorPrices?.[groupKey] || null;
+
           enriched.summary.colorways.push({
             variantId: groupKey,
             name: val.name || val.tips || "Unknown",
@@ -610,6 +619,8 @@ app.get("/api/staging/:id/variants", requireDb, async (req, res) => {
             imageCount: groupImages.length,
             skuCount: matchingSkus.length,
             sizes,
+            liveSizes,
+            colorPrice,
             priceRange: matchingSkus.length > 0
               ? { min: Math.min(...matchingSkus.map((s) => s.price || s.salePrice || Infinity)),
                   max: Math.max(...matchingSkus.map((s) => s.price || s.salePrice || 0)) }
@@ -682,13 +693,30 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
       );
       const childImageGroup = parentVariantData.imageGroups?.[variant_id] || [];
 
-      // Derive available sizes from matching SKU combos
+      // Derive available sizes from matching SKU combos (cartesian — all combos)
       const derivedSizes = [];
       for (const sku of childSkus) {
         const parts = (sku.propIds || "").split(",");
         // Size parts are everything except the color part
         const sizeParts = parts.filter((p) => p !== variant_id);
         if (sizeParts.length > 0) derivedSizes.push(sizeParts.join(","));
+      }
+
+      // Prefer live per-color size availability (from colorSizes) over cartesian
+      // derivedSizes. colorSizes reflects actual stock: if XXXL is sold out for
+      // black but available for blue, the split child inherits accordingly.
+      let liveSizes = null;
+      const colorSizeData = parentVariantData.colorSizes?.[variant_id];
+      if (colorSizeData && Array.isArray(colorSizeData.available)) {
+        // Find the size property to map IDs back to propId:valueId format
+        const sizeProp = (parentVariantData.properties || []).find(
+          (p) => !p.values.some((v) => v.image)
+        );
+        if (sizeProp) {
+          liveSizes = colorSizeData.available.map(
+            (s) => `${sizeProp.id}:${s.id}`
+          );
+        }
       }
 
       // Find the matching property value for this variant
@@ -706,6 +734,9 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
         if (matchedValue) break;
       }
 
+      // Priority: explicit request > live availability > cartesian combos
+      const finalSizes = available_sizes || liveSizes || derivedSizes;
+
       variantSpecifics = JSON.stringify({
         version: 2,
         parent_id: parent.id,
@@ -715,7 +746,8 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
         properties: parentVariantData.properties || [],
         skus: childSkus,
         imageGroups: { [variant_id]: childImageGroup },
-        available_sizes: available_sizes || derivedSizes,
+        available_sizes: finalSizes,
+        sizes_source: available_sizes ? "explicit" : liveSizes ? "live" : "derived",
         _decomposed: true,
       });
     } else {

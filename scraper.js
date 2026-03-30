@@ -473,14 +473,21 @@ async function scrapeProductDetail(page, productUrl, productId) {
             name = col.getAttribute("title") || col.textContent.trim();
           }
 
+          // Reconstruct full-size URL from thumbnail
+          // AliExpress swatch thumbnails: hash.jpg_220x220q75.jpg_.avif → hash.jpg
+          const toFullSize = (url) =>
+            url.replace(/[._]\d+x\d+q?\d*\.(?:jpg|jpeg|png|webp)_?\.?(?:avif|webp|jpg|png)?$/i, "");
+
           const val = { id: valueId, name };
           if (imgSrc) {
-            val.image = imgSrc;
-            images.add(imgSrc);
+            const fullSizeImg = toFullSize(imgSrc);
+            val.image = fullSizeImg;
+            val.thumbnailImage = imgSrc; // preserve original for reference
+            images.add(fullSizeImg);
             // Build imageGroups: "propertyId:valueId" → [image URLs]
             const groupKey = propId + ":" + valueId;
             if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
-            skuModel.imageGroups[groupKey].push(imgSrc);
+            skuModel.imageGroups[groupKey].push(fullSizeImg);
           }
           if (isDisabled) val.disabled = true;
 
@@ -637,6 +644,8 @@ async function scrapeProductDetail(page, productUrl, productId) {
         "S9bad0c7ed77b4899ae22645df613a766r","Sa42ea28366094829a2e882420e1e269aJ",
         "S3f91b770226a464c8baf581b22e148f7Y","S5fde9fa3ffdb45cf908380fcc49bf6771",
         "Sa3e67595f2374efa9ce9f91574dc4650T",
+        // Cross-product platform images (64x64/65x70 junk found across multiple products)
+        "S98a18bcd33c34d28a0e5276b0aa20f48e","Hfff52cf71f784d99ad93c73a334e7e37a",
       ]);
       const extractHash = (u) => { const m = u.match(/\/kf\/([A-Za-z0-9_]+)/); return m ? m[1] : null; };
 
@@ -698,6 +707,169 @@ async function scrapeProductDetail(page, productUrl, productId) {
         skuModel,
       };
     });
+
+    // ==================================================================
+    // POST-EXTRACTION: Per-color price + filmstrip enrichment
+    // ==================================================================
+    // Click each color swatch via CDP, read live price + filmstrip images.
+    // This captures per-color price differences and per-color gallery images
+    // that are only revealed when the user clicks a swatch.
+    // ==================================================================
+    const colorProp = result.skuModel.properties.find(
+      (p) => p.values.some((v) => v.image)
+    );
+    if (colorProp && colorProp.values.length > 0) {
+      const perColorData = {};
+      for (const val of colorProp.values) {
+        const colId = `${colorProp.id}-${val.id}`;
+        try {
+          // Click the swatch
+          await page.click(`[data-sku-col="${colId}"]`);
+          await page.waitForTimeout(800);
+
+          // Read price + filmstrip + size availability from the live page state
+          const snapshot = await page.evaluate(() => {
+            const curEl = document.querySelector(".price-default--current--F8OlYIo");
+            const origEl = document.querySelector(".price-default--original--CWcHOit");
+            const curText = curEl ? curEl.textContent.trim() : null;
+            const origText = origEl ? origEl.textContent.trim() : null;
+
+            // Parse numeric price from text like "₪124.47" or "$15.99"
+            const parsePrice = (t) => {
+              if (!t) return null;
+              const m = t.replace(/[^\d.,]/g, "").replace(",", ".");
+              const n = parseFloat(m);
+              return isNaN(n) ? null : n;
+            };
+
+            // Capture filmstrip: small thumbnail images (50-100px width)
+            const filmHashes = [];
+            const seen = new Set();
+            document.querySelectorAll("img").forEach((img) => {
+              const src = img.src || "";
+              const hash = (src.match(/\/kf\/([^/.]+)/) || [])[1] || "";
+              if (hash && !seen.has(hash) && img.naturalWidth >= 50 && img.naturalWidth <= 100) {
+                seen.add(hash);
+                filmHashes.push(hash);
+              }
+            });
+
+            // Also capture the hero image hash (the large one)
+            let heroHash = "";
+            document.querySelectorAll("img").forEach((img) => {
+              if (!heroHash && img.src.includes("/kf/") && img.naturalWidth >= 300) {
+                heroHash = (img.src.match(/\/kf\/([^/.]+)/) || [])[1] || "";
+              }
+            });
+
+            // Capture live size availability for the currently selected color.
+            // AliExpress uses sku-item--soldOut-- class on size buttons that are
+            // out of stock for the selected color. This differs per color swatch.
+            const liveSizes = [];
+            document.querySelectorAll('[data-sku-row="5"] [data-sku-col]').forEach((col) => {
+              const colId = col.getAttribute("data-sku-col") || "";
+              const dashIdx = colId.indexOf("-");
+              const valueId = dashIdx >= 0 ? colId.substring(dashIdx + 1) : colId;
+              const name = col.getAttribute("title") || col.textContent.trim();
+              const cls = col.className || "";
+              const isSoldOut = /sku-item--soldOut--/.test(cls);
+              const isDisabled = /sku-item--disabled--/.test(cls) || cls.includes("disabled");
+              liveSizes.push({ id: valueId, name, available: !isSoldOut && !isDisabled });
+            });
+
+            return {
+              currentPrice: parsePrice(curText),
+              currentPriceText: curText,
+              originalPrice: parsePrice(origText),
+              originalPriceText: origText,
+              filmstripHashes: filmHashes,
+              heroHash,
+              liveSizes,
+            };
+          });
+
+          perColorData[val.id] = snapshot;
+        } catch (e) {
+          // Swatch click failed — non-fatal, continue to next color
+          console.log(`  [variant] click failed for ${colId}: ${e.message}`);
+        }
+      }
+
+      // Enrich the skuModel with per-color price, filmstrip, and size availability
+      const colorGroupPrices = {};
+      const colorGroupFilmstrips = {};
+      const colorGroupSizes = {};
+      let allFilmstripsSame = true;
+      let firstFilmstrip = null;
+      let allSizesSame = true;
+      let firstSizeSet = null;
+
+      for (const val of colorProp.values) {
+        const data = perColorData[val.id];
+        if (!data) continue;
+
+        const groupKey = `${colorProp.id}:${val.id}`;
+
+        // Attach per-color price
+        if (data.currentPrice != null) {
+          colorGroupPrices[groupKey] = {
+            current: data.currentPrice,
+            original: data.originalPrice,
+            currentText: data.currentPriceText,
+          };
+        }
+
+        // Attach per-color filmstrip (filtered through existing junk filter)
+        if (data.filmstripHashes.length > 0) {
+          colorGroupFilmstrips[groupKey] = data.filmstripHashes;
+          if (!firstFilmstrip) {
+            firstFilmstrip = JSON.stringify(data.filmstripHashes);
+          } else if (JSON.stringify(data.filmstripHashes) !== firstFilmstrip) {
+            allFilmstripsSame = false;
+          }
+        }
+
+        // Attach per-color live size availability
+        // liveSizes: [{ id, name, available }] — from clicking this color swatch
+        if (data.liveSizes && data.liveSizes.length > 0) {
+          const availableIds = data.liveSizes
+            .filter((s) => s.available)
+            .map((s) => ({ id: s.id, name: s.name }));
+          const soldOutIds = data.liveSizes
+            .filter((s) => !s.available)
+            .map((s) => ({ id: s.id, name: s.name }));
+          colorGroupSizes[groupKey] = {
+            available: availableIds,
+            soldOut: soldOutIds,
+          };
+          const availKey = availableIds.map((s) => s.id).join(",");
+          if (!firstSizeSet) {
+            firstSizeSet = availKey;
+          } else if (availKey !== firstSizeSet) {
+            allSizesSame = false;
+          }
+        }
+      }
+
+      // Store in skuModel
+      if (Object.keys(colorGroupPrices).length > 0) {
+        result.skuModel.colorPrices = colorGroupPrices;
+      }
+
+      // Only store per-color filmstrips if they actually differ across colors
+      if (!allFilmstripsSame && Object.keys(colorGroupFilmstrips).length > 0) {
+        result.skuModel.colorFilmstrips = colorGroupFilmstrips;
+      }
+
+      // Store per-color size availability.
+      // Always store when captured — even if identical across colors, the split
+      // endpoint needs explicit available sizes per color, not just the union.
+      // The allSizesSame flag lets consumers know if sizes vary by color.
+      if (Object.keys(colorGroupSizes).length > 0) {
+        result.skuModel.colorSizes = colorGroupSizes;
+        result.skuModel.sizesVaryByColor = !allSizesSame;
+      }
+    }
 
     return result;
   } catch (err) {
@@ -1103,14 +1275,28 @@ async function mainWishlist() {
         const hasLegacy = Object.keys(detail.variantMap).length > 0;
 
         if (hasProperties || hasSkus || hasImageGroups || hasLegacy) {
-          variantSpecifics = JSON.stringify({
+          const v2Data = {
             version: 2,
             properties: detail.skuModel.properties,
             skus: detail.skuModel.skus,
             imageGroups: detail.skuModel.imageGroups,
             // Keep legacy variantMap for backward compat
             _legacyVariantMap: hasLegacy ? detail.variantMap : undefined,
-          });
+          };
+          // Per-color price (only present when prices differ by colorway)
+          if (detail.skuModel.colorPrices) {
+            v2Data.colorPrices = detail.skuModel.colorPrices;
+          }
+          // Per-color filmstrip (only present when filmstrip differs by colorway)
+          if (detail.skuModel.colorFilmstrips) {
+            v2Data.colorFilmstrips = detail.skuModel.colorFilmstrips;
+          }
+          // Per-color size availability (live sold-out detection per color swatch)
+          if (detail.skuModel.colorSizes) {
+            v2Data.colorSizes = detail.skuModel.colorSizes;
+            v2Data.sizesVaryByColor = detail.skuModel.sizesVaryByColor || false;
+          }
+          variantSpecifics = JSON.stringify(v2Data);
         }
       }
 
