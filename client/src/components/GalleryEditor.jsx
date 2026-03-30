@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { resolveGalleryUrl } from "../imgUrl";
 
 export default function GalleryEditor({ images, onSave, onSplit, saving, splitStatus }) {
   const [gallery, setGallery] = useState(images || []);
@@ -81,7 +82,7 @@ export default function GalleryEditor({ images, onSave, onSplit, saving, splitSt
               <div key={url + idx} style={{ ...S.thumb, ...(idx === 0 ? S.hero : {}) }}>
                 {!isFailed ? (
                   <img
-                    src={url}
+                    src={resolveGalleryUrl(url)}
                     alt={`Image ${idx + 1}`}
                     style={S.thumbImg}
                     loading="lazy"

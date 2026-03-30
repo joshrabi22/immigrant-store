@@ -26,6 +26,23 @@ function isAliCdn(url) {
   return url && (url.includes("alicdn.com") || url.includes("aliexpress-media.com"));
 }
 
+/**
+ * Resolve a raw gallery URL for display only.
+ * State and DB always retain the original URL — this is render-time only.
+ *
+ * - Cloudinary / non-AliCDN: return cleaned URL as-is
+ * - Local dev + AliCDN: return cleaned URL as-is (hotlink-blocked, known limitation)
+ * - Cloud + AliCDN: route through /api/image-proxy (adds AliExpress Referer server-side)
+ */
+export function resolveGalleryUrl(url) {
+  if (!url) return null;
+  const clean = cleanAliUrl(url);
+  if (!clean) return null;
+  if (!isAliCdn(clean)) return clean;        // Cloudinary or other CDN — use directly
+  if (isLocalDev()) return clean;            // Local dev — proxy not needed (image_path used for hero)
+  return `/api/image-proxy?url=${encodeURIComponent(clean)}`;
+}
+
 export default function imgUrl(item, bustCache) {
   const local = isLocalDev();
 
