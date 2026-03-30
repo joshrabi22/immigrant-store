@@ -552,6 +552,83 @@ app.post("/api/staging/:id/remove", requireDb, async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // STAGING — Split (T3/T3a)
+// GET /api/staging/:id/variants — structured variant/SKU data for split decisions
+//
+// Returns parsed variant_specifics with resolved image-to-variant mappings.
+// Clients use this to show which gallery images belong to which colorway,
+// and what sizes are available for each variant — enabling informed splits.
+app.get("/api/staging/:id/variants", requireDb, async (req, res) => {
+  try {
+    const id = parseId(req, res);
+    if (id === null) return;
+
+    const item = await queryOne(db, "SELECT variant_specifics, all_images, image_url FROM candidates WHERE id = ?", [id]);
+    if (!item) return res.status(404).json({ error: "Item not found" });
+
+    let variantData = null;
+    try { variantData = JSON.parse(item.variant_specifics || "null"); } catch (_) {}
+
+    if (!variantData) {
+      return res.json({ hasVariants: false, data: null });
+    }
+
+    // For version 2 format, enrich with image counts per group
+    if (variantData.version === 2) {
+      const enriched = {
+        hasVariants: true,
+        version: 2,
+        properties: variantData.properties || [],
+        skus: variantData.skus || [],
+        imageGroups: variantData.imageGroups || {},
+        summary: {
+          propertyCount: (variantData.properties || []).length,
+          skuCount: (variantData.skus || []).length,
+          imageGroupCount: Object.keys(variantData.imageGroups || {}).length,
+          colorways: [],
+        },
+      };
+
+      // Build colorway summary: for each image-bearing property value,
+      // list the name, image count, and available sizes
+      for (const prop of (variantData.properties || [])) {
+        for (const val of (prop.values || [])) {
+          if (!val.image) continue;
+          const groupKey = String(prop.id) + ":" + val.id;
+          const groupImages = variantData.imageGroups?.[groupKey] || [];
+          const matchingSkus = (variantData.skus || []).filter(
+            (s) => (s.propIds || "").includes(groupKey)
+          );
+          const sizes = matchingSkus.map((s) => {
+            const parts = (s.propIds || "").split(",");
+            return parts.filter((p) => p !== groupKey).join(",");
+          }).filter(Boolean);
+
+          enriched.summary.colorways.push({
+            variantId: groupKey,
+            name: val.name || val.tips || "Unknown",
+            image: val.image,
+            imageCount: groupImages.length,
+            skuCount: matchingSkus.length,
+            sizes,
+            priceRange: matchingSkus.length > 0
+              ? { min: Math.min(...matchingSkus.map((s) => s.price || s.salePrice || Infinity)),
+                  max: Math.max(...matchingSkus.map((s) => s.price || s.salePrice || 0)) }
+              : null,
+          });
+        }
+      }
+
+      return res.json(enriched);
+    }
+
+    // Legacy format — return as-is
+    return res.json({ hasVariants: true, version: 1, data: variantData });
+  } catch (err) {
+    console.error("[api/staging/:id/variants]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ---------------------------------------------------------------------------
 
 // POST /api/staging/:id/split — create a split child from a staged parent
@@ -560,6 +637,15 @@ app.post("/api/staging/:id/remove", requireDb, async (req, res) => {
 // The guarded parent UPDATE, child INSERT, and event INSERTs all execute
 // inside one transaction. If the parent guard fails (0 rows affected),
 // the transaction is rolled back — no child row, no events, no side effects.
+//
+// Split-aware SKU decomposition:
+// When the parent has enhanced variant_specifics (version: 2), the split
+// endpoint extracts the relevant subset of SKU data for the child:
+//   - Images from the matching imageGroup
+//   - SKU combinations that include the variant's property value
+//   - Available sizes derived from matching SKU combos
+// This ensures split children carry correct sizing/option data, not the
+// parent's full SKU model.
 app.post("/api/staging/:id/split", requireDb, async (req, res) => {
   try {
     const id = parseId(req, res);
@@ -582,12 +668,65 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
     const timestamp = now();
     const splitGroupId = parent.split_group_id || parent.id;
 
-    const variantSpecifics = JSON.stringify({
-      color_property: variant_id || null,
-      color_name: variant_name || null,
-      available_sizes: available_sizes || null,
-      parent_id: parent.id,
-    });
+    // --- Build child variant_specifics ---
+    // If parent has enhanced format (version: 2), extract the relevant subset.
+    // Otherwise, fall back to the simple format.
+    let variantSpecifics;
+    let parentVariantData = null;
+    try { parentVariantData = JSON.parse(parent.variant_specifics || "null"); } catch (_) {}
+
+    if (parentVariantData && parentVariantData.version === 2 && variant_id) {
+      // Enhanced decomposition: extract child's slice from parent's SKU model
+      const childSkus = (parentVariantData.skus || []).filter(
+        (sku) => (sku.propIds || "").includes(variant_id)
+      );
+      const childImageGroup = parentVariantData.imageGroups?.[variant_id] || [];
+
+      // Derive available sizes from matching SKU combos
+      const derivedSizes = [];
+      for (const sku of childSkus) {
+        const parts = (sku.propIds || "").split(",");
+        // Size parts are everything except the color part
+        const sizeParts = parts.filter((p) => p !== variant_id);
+        if (sizeParts.length > 0) derivedSizes.push(sizeParts.join(","));
+      }
+
+      // Find the matching property value for this variant
+      let matchedProperty = null;
+      let matchedValue = null;
+      for (const prop of (parentVariantData.properties || [])) {
+        for (const val of (prop.values || [])) {
+          const key = String(prop.id) + ":" + val.id;
+          if (key === variant_id) {
+            matchedProperty = prop;
+            matchedValue = val;
+            break;
+          }
+        }
+        if (matchedValue) break;
+      }
+
+      variantSpecifics = JSON.stringify({
+        version: 2,
+        parent_id: parent.id,
+        split_from_variant: variant_id,
+        color_property: variant_id,
+        color_name: variant_name || matchedValue?.name || matchedValue?.tips || null,
+        properties: parentVariantData.properties || [],
+        skus: childSkus,
+        imageGroups: { [variant_id]: childImageGroup },
+        available_sizes: available_sizes || derivedSizes,
+        _decomposed: true,
+      });
+    } else {
+      // Simple format (no enhanced parent data, or no variant_id)
+      variantSpecifics = JSON.stringify({
+        color_property: variant_id || null,
+        color_name: variant_name || null,
+        available_sizes: available_sizes || null,
+        parent_id: parent.id,
+      });
+    }
 
     // Compute updated parent gallery
     let parentGallery = [];

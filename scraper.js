@@ -381,17 +381,30 @@ async function scrapeSuggestedProducts(page) {
   });
 }
 
-// Scrape full product gallery from individual product page.
-// Same logic as alistream.js — kept in sync manually.
-async function scrapeProductGallery(page, productUrl, productId) {
+// ---------------------------------------------------------------------------
+// Scrape full product detail from individual product page.
+// Returns gallery images + full structured SKU model (properties, values,
+// image-to-variant mapping, prices per SKU combo).
+//
+// This is the critical layer for split-aware intake:
+//   - properties[].values[].image → which images belong to which colorway
+//   - skus[].propIds → which size+color combos exist and at what price
+//   - imageGroups{} → color value ID → [image URLs] for that variant
+//
+// When a listing contains multiple real products (e.g. hat with "America"
+// text vs hat with "Israel" text), imageGroups lets the split system
+// carry the correct images and sizes to each child listing.
+// ---------------------------------------------------------------------------
+
+async function scrapeProductDetail(page, productUrl, productId) {
   try {
     await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(2500);
 
     const result = await page.evaluate(() => {
       const images = new Set();
-      const variantMap = {};
 
+      // --- Collect all candidate images from DOM ---
       document.querySelectorAll(
         'img[src*="alicdn"], img[data-src*="alicdn"], img[src*="ae-pic"], img[data-src*="ae-pic"]'
       ).forEach((img) => {
@@ -406,25 +419,128 @@ async function scrapeProductGallery(page, productUrl, productId) {
         if (src) images.add(src);
       });
 
+      // --- Parse embedded JSON for structured SKU data ---
+      // AliExpress embeds product data in script tags as JSON blobs.
+      // We extract: imagePathList, productSKUPropertyList, skuPriceList.
+      let skuModel = { properties: [], skus: [], imageGroups: {} };
+      let imagePathList = [];
+
       const scripts = document.querySelectorAll("script");
       for (const script of scripts) {
         const text = script.textContent || "";
+        if (text.length < 100) continue;
+
+        // --- imagePathList: official ordered product gallery ---
         const imgListMatch = text.match(/"imagePathList"\s*:\s*\[(.*?)\]/);
         if (imgListMatch) {
           const urls = imgListMatch[1].match(/"(https?:\/\/[^"]+)"/g);
-          if (urls) urls.forEach((u) => images.add(u.replace(/"/g, "")));
+          if (urls) {
+            urls.forEach((u) => {
+              const clean = u.replace(/"/g, "");
+              images.add(clean);
+              imagePathList.push(clean);
+            });
+          }
         }
-        const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
-        for (const m of skuBlocks) {
-          const [_, propId, propName, imgUrl] = m;
-          images.add(imgUrl);
-          variantMap[imgUrl] = { propertyId: propId, propertyName: propName, sizes: [] };
+
+        // --- productSKUPropertyList: full property tree ---
+        // Try to find the full JSON blob for skuModule
+        const skuModuleMatch = text.match(/"skuModule"\s*:\s*\{/);
+        if (skuModuleMatch) {
+          // Extract the productSKUPropertyList array
+          const propListMatch = text.match(/"productSKUPropertyList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
+          if (propListMatch) {
+            try {
+              const propList = JSON.parse(propListMatch[1]);
+              for (const prop of propList) {
+                const property = {
+                  id: prop.skuPropertyId,
+                  name: prop.skuPropertyName || "",
+                  values: [],
+                };
+                if (Array.isArray(prop.skuPropertyValues)) {
+                  for (const val of prop.skuPropertyValues) {
+                    const v = {
+                      id: String(val.propertyValueId || val.propertyValueIdLong || ""),
+                      name: val.propertyValueDisplayName || val.skuPropertyValueShowOrder || val.propertyValueName || "",
+                      tips: val.skuPropertyTips || val.propertyValueName || "",
+                    };
+                    if (val.skuPropertyImagePath) {
+                      let img = val.skuPropertyImagePath;
+                      if (img.startsWith("//")) img = "https:" + img;
+                      v.image = img;
+                      images.add(img);
+                      // Build imageGroups: property value ID → [images]
+                      const groupKey = String(prop.skuPropertyId) + ":" + v.id;
+                      if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
+                      skuModel.imageGroups[groupKey].push(img);
+                    }
+                    property.values.push(v);
+                  }
+                }
+                skuModel.properties.push(property);
+              }
+            } catch (e) {
+              // JSON parse failed — fall through to regex extraction
+            }
+          }
+
+          // Extract skuPriceList (SKU combinations with prices)
+          const priceListMatch = text.match(/"skuPriceList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
+          if (priceListMatch) {
+            try {
+              const priceList = JSON.parse(priceListMatch[1]);
+              for (const sku of priceList) {
+                const skuEntry = {
+                  propIds: sku.skuPropIds || "",
+                  skuId: String(sku.skuId || ""),
+                };
+                if (sku.skuVal) {
+                  if (sku.skuVal.skuAmount) skuEntry.price = sku.skuVal.skuAmount.value;
+                  if (sku.skuVal.skuActivityAmount) skuEntry.salePrice = sku.skuVal.skuActivityAmount.value;
+                  if (sku.skuVal.availQuantity != null) skuEntry.quantity = sku.skuVal.availQuantity;
+                }
+                skuModel.skus.push(skuEntry);
+              }
+            } catch (e) {
+              // JSON parse failed
+            }
+          }
+        }
+
+        // --- Fallback regex extraction if JSON parse didn't capture properties ---
+        if (skuModel.properties.length === 0) {
+          // Forward pattern: skuPropertyId → skuPropertyName → skuPropertyImagePath
+          const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
+          const regexVariants = {};
+          for (const m of skuBlocks) {
+            const [_, propId, propName, imgUrl] = m;
+            images.add(imgUrl);
+            regexVariants[imgUrl] = { propertyId: propId, propertyName: propName };
+            if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
+            skuModel.imageGroups[propId].push(imgUrl);
+          }
+          // Reverse pattern
+          const skuBlocks2 = text.matchAll(/"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"[^}]*?"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"/g);
+          for (const m of skuBlocks2) {
+            const [_, imgUrl, propId, propName] = m;
+            images.add(imgUrl);
+            if (!regexVariants[imgUrl]) regexVariants[imgUrl] = { propertyId: propId, propertyName: propName };
+            if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
+            if (!skuModel.imageGroups[propId].includes(imgUrl)) skuModel.imageGroups[propId].push(imgUrl);
+          }
+        }
+
+        // --- Extract skuPropIds from price entries (for size mapping) ---
+        if (skuModel.skus.length === 0) {
+          const skuPrices = text.matchAll(/"skuPropIds"\s*:\s*"([^"]+)"/g);
+          for (const m of skuPrices) {
+            skuModel.skus.push({ propIds: m[1] });
+          }
         }
       }
 
-      // Known AliExpress page-chrome file hashes (service badges, trust icons,
-      // shipping graphics). These appear across 5-145 different products — never
-      // product images. Derived from cross-product frequency analysis.
+      // --- Filter and deduplicate images ---
       const PAGE_CHROME = new Set([
         "Sa976459fb7724bf1bca6e153a425a8ebg","S9e723ca0d10848499e4e3fb33be2224do",
         "S64c04957a1244dffbab7086d6e1a7cad7","Sb100bd23552d499c9fa8e1499f3c46dbw",
@@ -436,26 +552,20 @@ async function scrapeProductGallery(page, productUrl, productId) {
       ]);
       const extractHash = (u) => { const m = u.match(/\/kf\/([A-Za-z0-9_]+)/); return m ? m[1] : null; };
 
-      // Multi-layer filter: fingerprints + structural patterns + keywords
       const filtered = [...images].filter((url) => {
         if (!url || typeof url !== "string") return false;
         if (url.length < 30 || url.startsWith("data:")) return false;
-        // Non-CDN (broken/truncated URLs)
         if (!url.includes("alicdn.com") && !url.includes("aliexpress-media.com")) return false;
-        // Known page chrome
         const h = extractHash(url);
         if (h && PAGE_CHROME.has(h)) return false;
-        // Structural: tiny pixel images, thumbnails, quality-suffixed variants
         if (/\/\d{1,3}x\d{1,3}\.(?:png|jpg|gif)/i.test(url)) return false;
         if (/_\d{1,3}x\d{1,3}[._]/.test(url)) return false;
         if (/_\d{2,4}x\d{2,4}q\d+\.jpg/i.test(url)) return false;
         if (/\/ae-us\/.*?(category|nav|menu|header|footer)/i.test(url)) return false;
-        // Keywords
         if (/icon|sprite|logo|star|rating|arrow|button|banner|placeholder|avatar/i.test(url)) return false;
         return true;
       });
 
-      // Deduplicate by base URL (strip size suffixes + .avif wrappers)
       const baseUrl = (u) => {
         const m = u.match(/^(.*?\.(?:jpg|jpeg|png|webp))/i);
         return (m ? m[1] : u).replace(/^\/\//, "https://").toLowerCase();
@@ -468,14 +578,51 @@ async function scrapeProductGallery(page, productUrl, productId) {
         return true;
       });
 
-      return { images: deduped, variantMap };
+      // --- Build legacy variantMap for backward compat ---
+      const variantMap = {};
+      for (const prop of skuModel.properties) {
+        for (const val of prop.values) {
+          if (val.image) {
+            variantMap[val.image] = {
+              propertyId: String(prop.id) + ":" + val.id,
+              propertyName: val.name || val.tips || "",
+              sizes: [],
+            };
+          }
+        }
+      }
+      // Populate sizes from SKU combos
+      for (const sku of skuModel.skus) {
+        const parts = (sku.propIds || "").split(",");
+        if (parts.length < 2) continue;
+        const colorPart = parts[0]; // e.g. "14:10"
+        const sizePart = parts.slice(1).join(","); // e.g. "5:100" (could be multiple)
+        for (const [imgUrl, data] of Object.entries(variantMap)) {
+          if (data.propertyId === colorPart) {
+            data.sizes.push(sizePart);
+          }
+        }
+      }
+
+      return {
+        images: deduped,
+        imagePathList,
+        variantMap,
+        skuModel,
+      };
     });
 
     return result;
   } catch (err) {
     console.log(`  Gallery scrape failed for ${productId}: ${err.message}`);
-    return { images: [], variantMap: {} };
+    return { images: [], imagePathList: [], variantMap: {}, skuModel: { properties: [], skus: [], imageGroups: {} } };
   }
+}
+
+// Backward-compat wrapper — existing callers (suggested scrape) use this name
+async function scrapeProductGallery(page, productUrl, productId) {
+  const detail = await scrapeProductDetail(page, productUrl, productId);
+  return { images: detail.images, variantMap: detail.variantMap };
 }
 
 async function mainSuggested() {
@@ -659,9 +806,42 @@ async function scrapeWishlistProducts(page) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Helper: find the wishlist scroll container
+// AliExpress /p/wish-manage/ is a React SPA with a virtual-list inside a
+// scrollable div. Items only exist in DOM while visible. We must scroll
+// incrementally and scrape at each position.
+// ---------------------------------------------------------------------------
+function findScrollContainerJS() {
+  // Return JS code string to find the scroll container
+  return `
+    (() => {
+      const selectors = [
+        '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
+        '[class*="manage-list"]', '[class*="manageList"]',
+        '[class*="item-list"]', '[class*="itemList"]',
+        '[class*="product-list"]', '[class*="productList"]',
+        '[class*="scroll"]', '[class*="list-wrap"]',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.scrollHeight > el.clientHeight + 100) return el;
+      }
+      let best = null, bestH = 0;
+      document.querySelectorAll("div, section, ul").forEach(el => {
+        const oy = window.getComputedStyle(el).overflowY;
+        if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
+          bestH = el.scrollHeight; best = el;
+        }
+      });
+      return best;
+    })()
+  `;
+}
+
 async function mainWishlist() {
-  console.log("=== IMMIGRANT Store — AliExpress Wishlist Scraper ===\n");
-  console.log("This scrapes your saved/favorites items from the AliExpress wishlist page.\n");
+  console.log("=== IMMIGRANT Store — AliExpress Wishlist Scraper (Full Paginated) ===\n");
+  console.log("This scrapes your FULL wishlist from AliExpress.\n");
   console.log("Make sure Chrome is running with ./start-chrome.sh and you're logged in.\n");
 
   await waitForEnter("Press Enter when ready... ");
@@ -671,7 +851,7 @@ async function mainWishlist() {
   const db = getDb();
   await initSchema(db);
 
-  // Dedup against all existing candidates
+  // Dedup against all existing candidates (cross-source to prevent any duplicate product)
   const existingRows = await queryAll(db, "SELECT ali_product_id FROM candidates WHERE ali_product_id IS NOT NULL");
   const existingIds = new Set(existingRows.map((r) => r.ali_product_id));
 
@@ -691,8 +871,6 @@ async function mainWishlist() {
 
   try {
     console.log(`Navigating to ${WISHLIST_URL}...`);
-    // Use networkidle: /p/wish-manage/ is a React SPA — domcontentloaded fires
-    // before product cards render. networkidle waits for JS to settle.
     await page.goto(WISHLIST_URL, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(4000);
 
@@ -711,170 +889,108 @@ async function mainWishlist() {
       process.exit(1);
     }
 
-    // --- Pre-scroll diagnostic: sample anchor hrefs and find scroll container ---
-    const preDiag = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll("a[href]"));
-      const sampleHrefs = anchors.slice(0, 20).map(a => a.href);
+    // --- EXHAUSTIVE SCROLL-AND-SCRAPE ---
+    // Virtual list only renders visible items. We scroll through the entire
+    // list, scraping at each position, collecting unique product IDs.
+    // Stop after 3 consecutive scrolls yield zero new items.
+    console.log("\nStarting exhaustive scroll-and-scrape...");
+    const allProducts = new Map(); // ali_product_id → product data
+    let noNewRounds = 0;
+    const MAX_NO_NEW = 4; // stop after 4 scrolls with no new items
+    let scrollRound = 0;
 
-      // Find scrollable containers (overflowY auto/scroll, scrollHeight > clientHeight)
-      const scrollable = [];
-      document.querySelectorAll("div, section, ul, main").forEach(el => {
-        const oy = window.getComputedStyle(el).overflowY;
-        if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 50) {
-          scrollable.push({
-            tag: el.tagName,
-            id: el.id || null,
-            cls: (el.className || "").substring(0, 100),
-            scrollHeight: el.scrollHeight,
-            clientHeight: el.clientHeight,
-          });
-        }
-      });
+    // Initial scrape at current position
+    const initial = await scrapeWishlistProducts(page);
+    for (const p of initial) {
+      if (p.ali_product_id && !allProducts.has(p.ali_product_id)) {
+        allProducts.set(p.ali_product_id, p);
+      }
+    }
+    console.log(`  Round 0: ${initial.length} visible, ${allProducts.size} unique total`);
 
-      return { sampleHrefs, scrollable: scrollable.slice(0, 10) };
-    });
-    console.log("Sample hrefs (pre-scroll):", JSON.stringify(preDiag.sampleHrefs, null, 2));
-    console.log("Scrollable containers:", JSON.stringify(preDiag.scrollable, null, 2));
+    while (noNewRounds < MAX_NO_NEW) {
+      scrollRound++;
 
-    // --- Scroll inner container to trigger virtual list rendering ---
-    // AliExpress /p/wish-manage/ uses an inner scrollable div, not window scroll.
-    // Find it by overflow style; fall back to window if nothing found.
-    console.log("Scrolling wishlist container...");
-    for (let i = 0; i < 8; i++) {
+      // Scroll down one viewport in the container
       await page.evaluate(() => {
-        // Try known wish/manage/list selectors first
-        const selectors = [
-          '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
-          '[class*="manage-list"]', '[class*="manageList"]',
-          '[class*="item-list"]', '[class*="itemList"]',
-          '[class*="product-list"]', '[class*="productList"]',
-          '[class*="scroll"]', '[class*="list-wrap"]',
-        ];
-        let container = null;
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el && el.scrollHeight > el.clientHeight + 100) { container = el; break; }
-        }
-        // Fallback: tallest overflow-scroll div on the page
-        if (!container) {
-          let bestH = 0;
+        const container = (() => {
+          const selectors = [
+            '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
+            '[class*="manage-list"]', '[class*="manageList"]',
+            '[class*="item-list"]', '[class*="itemList"]',
+            '[class*="product-list"]', '[class*="productList"]',
+            '[class*="scroll"]', '[class*="list-wrap"]',
+          ];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.scrollHeight > el.clientHeight + 100) return el;
+          }
+          let best = null, bestH = 0;
           document.querySelectorAll("div, section, ul").forEach(el => {
             const oy = window.getComputedStyle(el).overflowY;
             if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
-              bestH = el.scrollHeight;
-              container = el;
+              bestH = el.scrollHeight; best = el;
             }
           });
-        }
-        if (container) {
-          container.scrollTop += container.clientHeight;
-        } else {
-          window.scrollBy(0, window.innerHeight);
-        }
-      });
-      await page.waitForTimeout(1500);
-    }
-    // Scroll back to top so we capture items from the beginning
-    await page.evaluate(() => {
-      const selectors = [
-        '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
-        '[class*="manage-list"]', '[class*="manageList"]',
-        '[class*="item-list"]', '[class*="itemList"]',
-        '[class*="scroll"]',
-      ];
-      let container = null;
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.scrollHeight > el.clientHeight + 100) { container = el; break; }
-      }
-      if (!container) {
-        let bestH = 0;
-        document.querySelectorAll("div, section, ul").forEach(el => {
-          const oy = window.getComputedStyle(el).overflowY;
-          if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
-            bestH = el.scrollHeight; container = el;
-          }
-        });
-      }
-      if (container) container.scrollTop = 0;
-      else window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(1500);
-
-    // Scroll back down slowly so virtual list renders all items top-to-bottom
-    console.log("Re-scrolling top-to-bottom to render all virtual list items...");
-    for (let i = 0; i < 8; i++) {
-      await page.evaluate(() => {
-        let container = null;
-        let bestH = 0;
-        document.querySelectorAll("div, section, ul").forEach(el => {
-          const oy = window.getComputedStyle(el).overflowY;
-          if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
-            bestH = el.scrollHeight; container = el;
-          }
-        });
+          return best;
+        })();
         if (container) container.scrollTop += container.clientHeight * 0.8;
         else window.scrollBy(0, window.innerHeight * 0.8);
       });
       await page.waitForTimeout(1500);
-    }
-    await page.waitForTimeout(1000);
 
-    // Save debug HTML for selector inspection
+      // Scrape visible items at this scroll position
+      const visible = await scrapeWishlistProducts(page);
+      let newCount = 0;
+      for (const p of visible) {
+        if (p.ali_product_id && !allProducts.has(p.ali_product_id)) {
+          allProducts.set(p.ali_product_id, p);
+          newCount++;
+        }
+      }
+
+      if (newCount === 0) {
+        noNewRounds++;
+      } else {
+        noNewRounds = 0;
+      }
+
+      console.log(`  Round ${scrollRound}: ${visible.length} visible, +${newCount} new, ${allProducts.size} unique total (noNew: ${noNewRounds}/${MAX_NO_NEW})`);
+    }
+
+    const products = Array.from(allProducts.values());
+    console.log(`\n=== Wishlist discovery complete: ${products.length} unique products found ===\n`);
+
+    // Save debug HTML
     const debugHtml = await page.content();
     fs.writeFileSync(path.join(__dirname, "debug-wishlist.html"), debugHtml);
-    console.log("Saved debug-wishlist.html for selector inspection.\n");
-
-    // Diagnostics
-    const diag = await page.evaluate(() => {
-      const operatorEls = Array.from(document.querySelectorAll('[data-id^="operator_"]'));
-      return {
-        // Primary signal — wishlist uses data-id="operator_PRODUCTID", not <a href>
-        operatorCards:   operatorEls.length,
-        sampleProductIds: operatorEls.slice(0, 5).map(el => el.getAttribute("data-id").replace("operator_", "")),
-        // Secondary signals
-        infiniteScroll:  document.querySelectorAll('[class*="infinite-scroll"]').length,
-        editItemWraps:   document.querySelectorAll('[class*="editItemWrap"]').length,
-        allImgs:         document.querySelectorAll("img").length,
-        allAnchors:      document.querySelectorAll("a[href]").length,
-        // Legacy — expected to be 0 on wish-manage page
-        itemLinks:       document.querySelectorAll('a[href*="/item/"]').length,
-      };
-    });
-    console.log("Selector diagnostics:", JSON.stringify(diag, null, 2));
-
-    if (diag.operatorCards === 0) {
-      console.log("\nNo operator_ product cards found on page.");
-      console.log("  Wishlist may be empty, or AliExpress changed the DOM structure.");
-      console.log("  Check debug-wishlist.html and look for '[data-id^=operator_]' elements.");
-      await page.close();
-      await browser.close();
-      return;
-    }
-
-    const products = await scrapeWishlistProducts(page);
-    console.log(`Found ${products.length} wishlist products.\n`);
+    console.log("Saved debug-wishlist.html\n");
 
     if (products.length === 0) {
-      console.log("Product extraction returned 0 items despite item links present.");
-      console.log("Check debug-wishlist.html — title or card detection may need adjustment.");
+      console.log("No products found. Check debug-wishlist.html.");
       await page.close();
       await browser.close();
       return;
     }
 
+    // --- INGEST EACH PRODUCT ---
+    // For each unique product: dedup check, download hero, scrape full gallery + SKU model.
     let added = 0;
     let skipped = 0;
+    const skippedItems = [];
 
     for (let i = 0; i < products.length; i++) {
       const p = products[i];
 
+      // Duplicate check: skip if already in DB (any source)
       if (p.ali_product_id && existingIds.has(p.ali_product_id)) {
         skipped++;
-        console.log(`  [${i + 1}/${products.length}] SKIP (already in DB): ${p.title.substring(0, 55)}...`);
+        skippedItems.push({ id: p.ali_product_id, title: p.title.substring(0, 50), reason: "already in DB" });
+        console.log(`  [${i + 1}/${products.length}] SKIP (dup): ${p.title.substring(0, 55)}...`);
         continue;
       }
 
+      // Download hero image locally
       let imagePath = null;
       if (p.image_url) {
         const filename = `wishlist_${sanitizeFilename(p.title)}_${Date.now()}.jpg`;
@@ -885,33 +1001,70 @@ async function mainWishlist() {
         } catch (_) {}
       }
 
-      // Gallery scrape — same path as suggested
+      // Full product page scrape: gallery + SKU model
       let allImages = null;
       let variantSpecifics = null;
+      let skuDataStr = null;
       if (p.product_url) {
-        const gallery = await scrapeProductGallery(page, p.product_url, p.ali_product_id);
-        if (gallery.images.length > 0) allImages = JSON.stringify(gallery.images);
-        if (Object.keys(gallery.variantMap).length > 0) variantSpecifics = JSON.stringify(gallery.variantMap);
+        const detail = await scrapeProductDetail(page, p.product_url, p.ali_product_id);
+        if (detail.images.length > 0) allImages = JSON.stringify(detail.images);
+
+        // Build enhanced variant_specifics (version 2 format)
+        const hasProperties = detail.skuModel.properties.length > 0;
+        const hasSkus = detail.skuModel.skus.length > 0;
+        const hasImageGroups = Object.keys(detail.skuModel.imageGroups).length > 0;
+        const hasLegacy = Object.keys(detail.variantMap).length > 0;
+
+        if (hasProperties || hasSkus || hasImageGroups || hasLegacy) {
+          variantSpecifics = JSON.stringify({
+            version: 2,
+            properties: detail.skuModel.properties,
+            skus: detail.skuModel.skus,
+            imageGroups: detail.skuModel.imageGroups,
+            // Keep legacy variantMap for backward compat
+            _legacyVariantMap: hasLegacy ? detail.variantMap : undefined,
+          });
+        }
       }
 
       const safePrice = (p.price != null && isFinite(p.price)) ? p.price : null;
       await run(db,
-        "INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url, status, stage, all_images, variant_specifics) VALUES (?, ?, ?, 'wishlist', ?, ?, ?, 'new', 'intake', ?, ?)",
-        [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url, allImages, variantSpecifics]
+        `INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url,
+         status, stage, all_images, variant_specifics, created_at)
+         VALUES (?, ?, ?, 'wishlist', ?, ?, ?, 'new', 'intake', ?, ?, ?)`,
+        [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url,
+         allImages, variantSpecifics, new Date().toISOString()]
       );
 
       if (p.ali_product_id) existingIds.add(p.ali_product_id);
       added++;
 
       const galleryCount = allImages ? JSON.parse(allImages).length : 0;
-      const shortTitle = p.title.substring(0, 55);
+      const variantCount = variantSpecifics ? JSON.parse(variantSpecifics).properties?.length || 0 : 0;
+      const skuCount = variantSpecifics ? JSON.parse(variantSpecifics).skus?.length || 0 : 0;
+      const shortTitle = p.title.substring(0, 50);
       const priceStr = p.price ? `$${p.price}` : "no price";
-      console.log(`  [${i + 1}/${products.length}] ${shortTitle}... — ${priceStr} (${galleryCount} gallery imgs)`);
+      console.log(`  [${i + 1}/${products.length}] ${shortTitle}... — ${priceStr} (${galleryCount} imgs, ${variantCount} props, ${skuCount} skus)`);
     }
 
+    // --- SUMMARY ---
     const countRow = await queryAll(db, "SELECT COUNT(*) as c FROM candidates");
-    console.log(`\n=== Done! Added ${added} wishlist candidates, skipped ${skipped} duplicates ===`);
-    console.log(`Total candidates: ${countRow[0].c}`);
+    const wishlistCount = await queryAll(db, "SELECT COUNT(*) as c FROM candidates WHERE source = 'wishlist'");
+    console.log(`\n=== WISHLIST SCRAPE COMPLETE ===`);
+    console.log(`  Discovered:  ${products.length} unique products`);
+    console.log(`  Added:       ${added} new candidates`);
+    console.log(`  Skipped:     ${skipped} duplicates`);
+    console.log(`  Total DB:    ${countRow[0].c} candidates`);
+    console.log(`  Wishlist DB: ${wishlistCount[0].c} wishlist candidates`);
+    console.log(`  Scroll rounds: ${scrollRound}`);
+    console.log(`  Scrape status: COMPLETE (exhausted after ${MAX_NO_NEW} consecutive no-new scrolls)`);
+
+    if (skippedItems.length > 0) {
+      console.log(`\n  Skipped items:`);
+      for (const s of skippedItems) {
+        console.log(`    - [${s.id}] ${s.title} (${s.reason})`);
+      }
+    }
   } catch (err) {
     console.error("Error during scraping:", err.message);
     try {
