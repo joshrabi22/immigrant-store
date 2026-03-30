@@ -78,6 +78,43 @@ app.get("/api/health", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// IMAGE PROXY — serve AliExpress CDN images through backend to avoid hotlink blocks
+// ---------------------------------------------------------------------------
+//
+// On Railway, local image files don't exist (ephemeral filesystem) and AliExpress
+// CDN hotlink-protects images (403/blank when loaded from non-AliExpress origins).
+// This proxy fetches images server-side (no hotlink issue) and caches via headers.
+// Only allows AliExpress CDN domains to prevent open-proxy abuse.
+
+app.get("/api/image-proxy", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Missing url param" });
+
+  // Allowlist: only proxy AliExpress CDN images
+  if (!url.includes("alicdn.com") && !url.includes("aliexpress-media.com")) {
+    return res.status(403).json({ error: "Only AliExpress CDN URLs allowed" });
+  }
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "Referer": "https://www.aliexpress.com/",
+        "User-Agent": "Mozilla/5.0 (compatible; ImmigrantStore/1.0)"
+      }
+    });
+    if (!response.ok) return res.status(response.status).end();
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.set("Content-Type", response.headers.get("content-type") || "image/jpeg");
+    res.set("Cache-Control", "public, max-age=604800"); // 7-day browser cache
+    res.send(buffer);
+  } catch (err) {
+    console.error("[image-proxy] Fetch failed:", url, err.message);
+    res.status(502).end();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // COUNTS — single endpoint for all sidebar badges
 // ---------------------------------------------------------------------------
 //

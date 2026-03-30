@@ -1,10 +1,13 @@
 // Get the best image URL for a candidate
-// On Railway: image_path files don't exist, so use AliExpress CDN (image_url)
-// Locally: image_path files exist and load faster + avoid CDN hotlink blocks
 //
-// Strategy: prefer local image_path (served via /images/ static route) when
-// available — AliExpress CDN hotlink-protects images loaded from localhost.
-// Fall back to CDN URL only when no local file exists (Railway deployment).
+// Local dev:  prefer image_path (served via /images/ static route) — avoids
+//             AliExpress CDN hotlink blocks on localhost.
+// Cloud:      image_path files don't exist (Railway filesystem is ephemeral).
+//             AliExpress CDN is also hotlink-blocked from non-AliExpress origins.
+//             Use /api/image-proxy to fetch images server-side (no hotlink issue).
+//
+// processed_image_url (Cloudinary) is checked BEFORE calling imgUrl() in every
+// component, so this function only handles unprocessed source images.
 
 function cleanAliUrl(url) {
   if (!url) return null;
@@ -14,16 +17,34 @@ function cleanAliUrl(url) {
   return jpgMatch ? jpgMatch[1] : url.replace(/_?\.avif$/i, "");
 }
 
+function isLocalDev() {
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1";
+}
+
+function isAliCdn(url) {
+  return url && (url.includes("alicdn.com") || url.includes("aliexpress-media.com"));
+}
+
 export default function imgUrl(item, bustCache) {
-  // Prefer local path — served by express.static('/images'), avoids CDN hotlink blocks
-  if (item.image_path) {
-    const local = `/images/${item.image_path.replace("images/", "")}`;
-    return bustCache ? `${local}?t=${Date.now()}` : local;
+  const local = isLocalDev();
+
+  // Local dev: use static file path (works, avoids CDN hotlink on localhost)
+  if (local && item.image_path) {
+    const p = `/images/${item.image_path.replace("images/", "")}`;
+    return bustCache ? `${p}?t=${Date.now()}` : p;
   }
 
-  // Fall back to CDN URL (Railway deployment where local files don't exist)
-  if (item.image_url) {
-    return cleanAliUrl(item.image_url);
+  // Resolve the CDN URL
+  const cdn = cleanAliUrl(item.image_url);
+
+  if (cdn) {
+    // Cloud: proxy AliExpress images through backend to avoid hotlink blocks
+    if (!local && isAliCdn(cdn)) {
+      return `/api/image-proxy?url=${encodeURIComponent(cdn)}`;
+    }
+    // Non-AliExpress URLs or local fallback: use directly
+    return cdn;
   }
 
   return null;
