@@ -419,18 +419,102 @@ async function scrapeProductDetail(page, productUrl, productId) {
         if (src) images.add(src);
       });
 
-      // --- Parse embedded JSON for structured SKU data ---
-      // AliExpress embeds product data in script tags as JSON blobs.
-      // We extract: imagePathList, productSKUPropertyList, skuPriceList.
+      // ==================================================================
+      // PRIMARY: DOM-based SKU extraction (current AliExpress 2025-2026)
+      // ==================================================================
+      // AliExpress renders variant data as DOM elements with data attributes:
+      //   data-sku-row="14"           → property ID (14=Color, 5=Size)
+      //   data-sku-col="14-200004890" → property:value ID pair
+      //
+      // Each sku-item contains either:
+      //   - An <img> with alt text → color/style variant with image
+      //   - Text content          → size/option variant
+      //
+      // This is now the primary extraction method because AliExpress no
+      // longer embeds skuModule JSON in script tags on most pages.
+      // ==================================================================
+
       let skuModel = { properties: [], skus: [], imageGroups: {} };
       let imagePathList = [];
+
+      // Well-known AliExpress property IDs → human-readable names
+      const KNOWN_PROP_NAMES = {
+        "14": "Color", "5": "Size", "200007763": "Shoe Size",
+        "200000828": "Length", "200000828": "Shoe Width",
+      };
+
+      const skuRows = document.querySelectorAll("[data-sku-row]");
+      const seenProps = new Set();
+
+      skuRows.forEach((row) => {
+        const propId = row.getAttribute("data-sku-row");
+        if (!propId || seenProps.has(propId)) return;
+        seenProps.add(propId);
+
+        const values = [];
+        const cols = row.querySelectorAll("[data-sku-col]");
+
+        cols.forEach((col) => {
+          const colId = col.getAttribute("data-sku-col") || "";
+          // Format: "propertyId-valueId" e.g. "14-200004890"
+          const dashIdx = colId.indexOf("-");
+          const valueId = dashIdx >= 0 ? colId.substring(dashIdx + 1) : colId;
+
+          const img = col.querySelector("img");
+          const isDisabled = (col.className || "").includes("disabled");
+
+          let name = "";
+          let imgSrc = null;
+
+          if (img) {
+            name = img.alt || col.getAttribute("title") || "";
+            imgSrc = img.src || img.getAttribute("data-src") || "";
+          } else {
+            name = col.getAttribute("title") || col.textContent.trim();
+          }
+
+          const val = { id: valueId, name };
+          if (imgSrc) {
+            val.image = imgSrc;
+            images.add(imgSrc);
+            // Build imageGroups: "propertyId:valueId" → [image URLs]
+            const groupKey = propId + ":" + valueId;
+            if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
+            skuModel.imageGroups[groupKey].push(imgSrc);
+          }
+          if (isDisabled) val.disabled = true;
+
+          values.push(val);
+        });
+
+        if (values.length > 0) {
+          // Determine property name: known ID, or infer from content
+          let propName = KNOWN_PROP_NAMES[propId] || "";
+          if (!propName) {
+            propName = values.some((v) => v.image) ? "Color" : "Size";
+          }
+
+          skuModel.properties.push({
+            id: parseInt(propId) || propId,
+            name: propName,
+            values,
+          });
+        }
+      });
+
+      // ==================================================================
+      // FALLBACK: Script-tag JSON extraction (older AliExpress pages)
+      // ==================================================================
+      // Some pages still embed skuModule in script tags. Only use this
+      // if the DOM extraction found zero properties.
+      // ==================================================================
 
       const scripts = document.querySelectorAll("script");
       for (const script of scripts) {
         const text = script.textContent || "";
         if (text.length < 100) continue;
 
-        // --- imagePathList: official ordered product gallery ---
+        // imagePathList: official ordered product gallery (still in scripts)
         const imgListMatch = text.match(/"imagePathList"\s*:\s*\[(.*?)\]/);
         if (imgListMatch) {
           const urls = imgListMatch[1].match(/"(https?:\/\/[^"]+)"/g);
@@ -443,104 +527,108 @@ async function scrapeProductDetail(page, productUrl, productId) {
           }
         }
 
-        // --- productSKUPropertyList: full property tree ---
-        // Try to find the full JSON blob for skuModule
-        const skuModuleMatch = text.match(/"skuModule"\s*:\s*\{/);
-        if (skuModuleMatch) {
-          // Extract the productSKUPropertyList array
-          const propListMatch = text.match(/"productSKUPropertyList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
-          if (propListMatch) {
-            try {
-              const propList = JSON.parse(propListMatch[1]);
-              for (const prop of propList) {
-                const property = {
-                  id: prop.skuPropertyId,
-                  name: prop.skuPropertyName || "",
-                  values: [],
-                };
-                if (Array.isArray(prop.skuPropertyValues)) {
-                  for (const val of prop.skuPropertyValues) {
-                    const v = {
-                      id: String(val.propertyValueId || val.propertyValueIdLong || ""),
-                      name: val.propertyValueDisplayName || val.skuPropertyValueShowOrder || val.propertyValueName || "",
-                      tips: val.skuPropertyTips || val.propertyValueName || "",
-                    };
-                    if (val.skuPropertyImagePath) {
-                      let img = val.skuPropertyImagePath;
-                      if (img.startsWith("//")) img = "https:" + img;
-                      v.image = img;
-                      images.add(img);
-                      // Build imageGroups: property value ID → [images]
-                      const groupKey = String(prop.skuPropertyId) + ":" + v.id;
-                      if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
-                      skuModel.imageGroups[groupKey].push(img);
-                    }
-                    property.values.push(v);
-                  }
-                }
-                skuModel.properties.push(property);
-              }
-            } catch (e) {
-              // JSON parse failed — fall through to regex extraction
-            }
-          }
-
-          // Extract skuPriceList (SKU combinations with prices)
-          const priceListMatch = text.match(/"skuPriceList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
-          if (priceListMatch) {
-            try {
-              const priceList = JSON.parse(priceListMatch[1]);
-              for (const sku of priceList) {
-                const skuEntry = {
-                  propIds: sku.skuPropIds || "",
-                  skuId: String(sku.skuId || ""),
-                };
-                if (sku.skuVal) {
-                  if (sku.skuVal.skuAmount) skuEntry.price = sku.skuVal.skuAmount.value;
-                  if (sku.skuVal.skuActivityAmount) skuEntry.salePrice = sku.skuVal.skuActivityAmount.value;
-                  if (sku.skuVal.availQuantity != null) skuEntry.quantity = sku.skuVal.availQuantity;
-                }
-                skuModel.skus.push(skuEntry);
-              }
-            } catch (e) {
-              // JSON parse failed
-            }
-          }
-        }
-
-        // --- Fallback regex extraction if JSON parse didn't capture properties ---
+        // Only parse skuModule from scripts if DOM extraction found nothing
         if (skuModel.properties.length === 0) {
-          // Forward pattern: skuPropertyId → skuPropertyName → skuPropertyImagePath
-          const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
-          const regexVariants = {};
-          for (const m of skuBlocks) {
-            const [_, propId, propName, imgUrl] = m;
-            images.add(imgUrl);
-            regexVariants[imgUrl] = { propertyId: propId, propertyName: propName };
-            if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
-            skuModel.imageGroups[propId].push(imgUrl);
-          }
-          // Reverse pattern
-          const skuBlocks2 = text.matchAll(/"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"[^}]*?"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"/g);
-          for (const m of skuBlocks2) {
-            const [_, imgUrl, propId, propName] = m;
-            images.add(imgUrl);
-            if (!regexVariants[imgUrl]) regexVariants[imgUrl] = { propertyId: propId, propertyName: propName };
-            if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
-            if (!skuModel.imageGroups[propId].includes(imgUrl)) skuModel.imageGroups[propId].push(imgUrl);
-          }
-        }
+          const skuModuleMatch = text.match(/"skuModule"\s*:\s*\{/);
+          if (skuModuleMatch) {
+            const propListMatch = text.match(/"productSKUPropertyList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
+            if (propListMatch) {
+              try {
+                const propList = JSON.parse(propListMatch[1]);
+                for (const prop of propList) {
+                  const property = { id: prop.skuPropertyId, name: prop.skuPropertyName || "", values: [] };
+                  if (Array.isArray(prop.skuPropertyValues)) {
+                    for (const val of prop.skuPropertyValues) {
+                      const v = {
+                        id: String(val.propertyValueId || val.propertyValueIdLong || ""),
+                        name: val.propertyValueDisplayName || val.skuPropertyTips || val.propertyValueName || "",
+                      };
+                      if (val.skuPropertyImagePath) {
+                        let img = val.skuPropertyImagePath;
+                        if (img.startsWith("//")) img = "https:" + img;
+                        v.image = img;
+                        images.add(img);
+                        const groupKey = String(prop.skuPropertyId) + ":" + v.id;
+                        if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
+                        skuModel.imageGroups[groupKey].push(img);
+                      }
+                      property.values.push(v);
+                    }
+                  }
+                  skuModel.properties.push(property);
+                }
+              } catch (e) { /* JSON parse failed */ }
+            }
 
-        // --- Extract skuPropIds from price entries (for size mapping) ---
-        if (skuModel.skus.length === 0) {
-          const skuPrices = text.matchAll(/"skuPropIds"\s*:\s*"([^"]+)"/g);
-          for (const m of skuPrices) {
-            skuModel.skus.push({ propIds: m[1] });
+            const priceListMatch = text.match(/"skuPriceList"\s*:\s*(\[[\s\S]*?\])\s*[,}]/);
+            if (priceListMatch) {
+              try {
+                const priceList = JSON.parse(priceListMatch[1]);
+                for (const sku of priceList) {
+                  const entry = { propIds: sku.skuPropIds || "" };
+                  if (sku.skuVal) {
+                    if (sku.skuVal.skuAmount) entry.price = sku.skuVal.skuAmount.value;
+                    if (sku.skuVal.skuActivityAmount) entry.salePrice = sku.skuVal.skuActivityAmount.value;
+                    if (sku.skuVal.availQuantity != null) entry.quantity = sku.skuVal.availQuantity;
+                  }
+                  skuModel.skus.push(entry);
+                }
+              } catch (e) { /* JSON parse failed */ }
+            }
+          }
+
+          // Last-resort regex: skuPropertyId → image in raw text
+          if (skuModel.properties.length === 0) {
+            const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
+            for (const m of skuBlocks) {
+              const [_, propId, propName, imgUrl] = m;
+              images.add(imgUrl);
+              if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
+              skuModel.imageGroups[propId].push(imgUrl);
+            }
+          }
+
+          if (skuModel.skus.length === 0) {
+            const skuPrices = text.matchAll(/"skuPropIds"\s*:\s*"([^"]+)"/g);
+            for (const m of skuPrices) skuModel.skus.push({ propIds: m[1] });
           }
         }
       }
 
-      // --- Filter and deduplicate images ---
+      // ==================================================================
+      // POST-EXTRACTION: Build SKU combo list from DOM property IDs
+      // ==================================================================
+      // If we got properties from DOM but no SKU combos from scripts,
+      // generate all valid combos from the property value IDs.
+      // Format: "14:200004890,5:361386" (color:value,size:value)
+      // ==================================================================
+      if (skuModel.properties.length > 0 && skuModel.skus.length === 0) {
+        // Build all possible combinations
+        const propArrays = skuModel.properties.map((p) =>
+          p.values.filter((v) => !v.disabled).map((v) => String(p.id) + ":" + v.id)
+        );
+        // Cartesian product (max 2 properties — Color × Size)
+        if (propArrays.length === 1) {
+          skuModel.skus = propArrays[0].map((id) => ({ propIds: id }));
+        } else if (propArrays.length === 2) {
+          for (const a of propArrays[0]) {
+            for (const b of propArrays[1]) {
+              skuModel.skus.push({ propIds: a + "," + b });
+            }
+          }
+        } else if (propArrays.length >= 3) {
+          // 3+ properties — just pair them without full cartesian to avoid explosion
+          for (const a of propArrays[0]) {
+            for (const b of propArrays[1]) {
+              skuModel.skus.push({ propIds: a + "," + b });
+            }
+          }
+        }
+      }
+
+      // ==================================================================
+      // FILTER & DEDUP images
+      // ==================================================================
       const PAGE_CHROME = new Set([
         "Sa976459fb7724bf1bca6e153a425a8ebg","S9e723ca0d10848499e4e3fb33be2224do",
         "S64c04957a1244dffbab7086d6e1a7cad7","Sb100bd23552d499c9fa8e1499f3c46dbw",
@@ -578,28 +666,27 @@ async function scrapeProductDetail(page, productUrl, productId) {
         return true;
       });
 
-      // --- Build legacy variantMap for backward compat ---
+      // ==================================================================
+      // BUILD legacy variantMap for backward compat
+      // ==================================================================
       const variantMap = {};
       for (const prop of skuModel.properties) {
         for (const val of prop.values) {
           if (val.image) {
+            const propKey = String(prop.id) + ":" + val.id;
             variantMap[val.image] = {
-              propertyId: String(prop.id) + ":" + val.id,
-              propertyName: val.name || val.tips || "",
+              propertyId: propKey,
+              propertyName: val.name || "",
               sizes: [],
             };
-          }
-        }
-      }
-      // Populate sizes from SKU combos
-      for (const sku of skuModel.skus) {
-        const parts = (sku.propIds || "").split(",");
-        if (parts.length < 2) continue;
-        const colorPart = parts[0]; // e.g. "14:10"
-        const sizePart = parts.slice(1).join(","); // e.g. "5:100" (could be multiple)
-        for (const [imgUrl, data] of Object.entries(variantMap)) {
-          if (data.propertyId === colorPart) {
-            data.sizes.push(sizePart);
+            // Populate sizes: find SKU combos containing this color
+            for (const sku of skuModel.skus) {
+              const parts = (sku.propIds || "").split(",");
+              if (parts.includes(propKey) || parts[0] === propKey) {
+                const sizeParts = parts.filter((p) => p !== propKey);
+                if (sizeParts.length > 0) variantMap[val.image].sizes.push(sizeParts.join(","));
+              }
+            }
           }
         }
       }
