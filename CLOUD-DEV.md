@@ -84,14 +84,17 @@ Railway auto-deploys from the GitHub repo. Build takes ~2-3 minutes.
 ### Step 4: Verify deployment
 
 ```bash
-# Health check
-curl https://curate.22immigrant.com/api/stats
+# Health check (Railway domain)
+curl https://tender-luck-production-3a77.up.railway.app/api/health
 
 # Counts
-curl https://curate.22immigrant.com/api/counts
+curl https://tender-luck-production-3a77.up.railway.app/api/counts
 
 # Open in browser
-open https://curate.22immigrant.com
+open https://tender-luck-production-3a77.up.railway.app
+
+# Once custom domain is configured:
+# curl https://curate.22immigrant.com/api/health
 ```
 
 ### Step 5: Sync local data to Turso (optional)

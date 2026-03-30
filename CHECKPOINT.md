@@ -8,7 +8,12 @@ _Last updated: 2026-03-30_
 
 **Active agent:** Claude Code (Cowork) — transitioned from ChatGPT-led sessions on 2026-03-29.
 **Execution model:** ChatGPT = architect / validates decisions. Claude Code = executor. CLAUDE.md is the primary working reference.
-**Active testing DB:** Local SQLite (`data.db`). Turso cloud (670+ candidates) is a separate data world. Always confirm which DB the server is using from startup logs. Use `TURSO_DATABASE_URL= TURSO_AUTH_TOKEN=` prefix to force local SQLite.
+**Primary dev environment:** Railway cloud (migrated 2026-03-30).
+**Cloud URL:** `https://tender-luck-production-3a77.up.railway.app` (Railway-generated domain)
+**Custom domain:** `curate.22immigrant.com` (pending DNS configuration)
+**Database:** Turso cloud — single source of truth. Local SQLite (`data.db`) is a separate data world used only for local testing.
+**Processing mode:** Inline (no Redis). `REDIS_URL` is intentionally absent — Ghost Logic runs via `await processCandidate()` directly in the HTTP handler.
+**Deploy workflow:** `git push origin main` → Railway auto-deploys (~2-3 min). No manual server restarts.
 
 ## Current Verified State
 
@@ -49,28 +54,59 @@ _Last updated: 2026-03-30_
 
 ## Active Commands
 
+### Cloud (primary — Railway)
 ```bash
+# Deploy: commit + push triggers auto-deploy
+git add -A && git commit -m "description" && git push origin main
+
+# Verify cloud health
+curl https://tender-luck-production-3a77.up.railway.app/api/health
+curl https://tender-luck-production-3a77.up.railway.app/api/counts
+
+# View in browser
+open https://tender-luck-production-3a77.up.railway.app
+```
+
+### Local (secondary — for scraping and testing)
+```bash
+# Force local SQLite for server
+TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server.js
+
 # Run suggested scraper locally
 node scraper.js suggested
 
 # Run wishlist scraper locally
 node scraper.js wishlist
 
-# Force local SQLite for server
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server.js
-
 # Process a single candidate directly (local SQLite)
 TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct <candidate_id>
 
 # Process against Turso cloud
 node server/workers/ghostLogicWorker.js --direct <candidate_id>
-
-# Repair bad legacy hero images (idempotent)
-node repair-bad-heroes.js
-
-# Clear stale processing_status on legacy items (idempotent)
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node repair-stale-pending.js
 ```
+
+## Resolved (2026-03-30, batch 12) — Cloud migration to Railway
+
+**Goal:** Move from unstable local dev environment to persistent Railway cloud deployment.
+
+**What was done:**
+1. Fixed `railway.toml` healthcheck path (`/api/stats` → `/api/health`)
+2. Updated `.gitignore` and `.dockerignore` for clean builds
+3. Created `.env.example` with complete variable documentation
+4. Created `CLOUD-DEV.md` with full architecture and migration guide
+5. Committed and pushed (555308a) — Railway auto-deployed successfully
+6. Generated public domain: `tender-luck-production-3a77.up.railway.app`
+7. Verified: `/api/health` returns `{"ok":true,"dbReady":true}`, `/api/counts` returns live Turso data, full UI renders correctly
+
+**Architecture:** Express API + React SPA in single Railway service. Turso cloud DB. Inline Ghost Logic (no Redis). Railway auto-deploys on `git push`.
+
+**Railway env vars present (9):** ANTHROPIC_API_KEY, CJ_API_EMAIL, CJ_API_KEY, REMOVEBG_API_KEY, SHOPIFY_ACCESS_TOKEN, SHOPIFY_API_KEY, SHOPIFY_STORE_URL, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+
+**Railway env vars MISSING (3 — needed for Ghost Logic):** PHOTOROOM_API_KEY, GEMINI_API_KEY, CLOUDINARY_URL
+
+**Correctly absent:** REDIS_URL (inline processing mode as designed)
+
+**Known limitation:** AliExpress CDN images are hotlink-blocked — intake cards show blank images. Processed images (Cloudinary) will display correctly once CLOUDINARY_URL is set.
 
 ## Resolved (2026-03-30, batch 11) — Inline Ghost Logic for local mode (no Redis)
 
@@ -278,30 +314,29 @@ rm client/src/components/ProductEditor.jsx    # dead — only imported by dead E
 
 ## Next Action
 
-**Josh must run (before anything else):**
-1. Stop the server (`Ctrl-C`)
-2. Run: `TURSO_DATABASE_URL= node repair-db-rebuild.js`
-3. Restart: `TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server.js`
-4. Delete dead files (see Cleanup section above)
-5. Rebuild client: `cd client && npm run build` (picks up imgUrl + gallery filter changes)
+**Josh must add 3 missing Railway env vars (required for Ghost Logic pipeline):**
+In Railway dashboard → tender-luck → Variables → + New Variable:
+1. `PHOTOROOM_API_KEY` — value from local `.env` (Stage 1 extraction)
+2. `GEMINI_API_KEY` — value from local `.env` (Stage 2 compositing)
+3. `CLOUDINARY_URL` — value from local `.env` (processed image hosting)
 
-**After DB repair + build — reprocess all Photo Suite items:**
-All 7 Photo Suite items have `processed_images` generated from unfiltered galleries (sweaters/pullovers contaminating sunglasses listings etc.). Reprocess each with the fixed worker:
-```bash
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1019
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1035
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1041
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1051
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1052
-TURSO_DATABASE_URL= TURSO_AUTH_TOKEN= node server/workers/ghostLogicWorker.js --direct 1057
-```
-(Skip 1049 — has corrupted `all_images`, needs re-scrape first)
+Without these, the Process button on cloud will fail at Stage 1. The app runs and serves UI, but image processing is non-functional.
 
-6. Resubmit ID 1034 to processing (revision_needed → re-process via staging UI or direct mode after resetting review_status)
-7. Re-scrape 1043 and 1048 galleries if needed (both have `all_images = NULL` after corruption repair)
-8. Photo Suite UX refinement
-9. Build Launch page (publish workflow)
-10. Build Live page (published products management)
+**Optional: configure custom domain**
+Add `curate.22immigrant.com` via Railway Settings → Networking → Custom Domain. Then update DNS (CNAME to Railway).
+
+**After env vars are set:**
+1. Test processing a candidate from the cloud UI (click Process on any staged item)
+2. Verify Cloudinary upload works (processed images should load)
+3. Delete dead frontend files (see Cleanup section)
+4. Photo Suite UX refinement
+5. Build Launch page (publish workflow)
+6. Build Live page (published products management)
+
+**Local-only tasks (optional, not blocking cloud):**
+- Run `TURSO_DATABASE_URL= node repair-db-rebuild.js` to fix local SQLite page corruption
+- Reprocess local Photo Suite items with fixed worker
+- Re-scrape galleries for IDs 1043, 1048 (both have `all_images = NULL`)
 
 ## Operating Rules
 

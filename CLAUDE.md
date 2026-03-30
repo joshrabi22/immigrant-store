@@ -207,12 +207,15 @@ Two-tap confirm pattern: first tap arms the split, second tap confirms (auto-dis
 ### AliExpress Scraping
 `scraper.js` uses CDP (`http://localhost:9222`) against a real logged-in Chrome session. `alistream.js` runs headless Playwright for 24/7 ingestion on Railway with a 3-layer junk filter (title keywords → red banner pixel check → Claude vision classifier). Claude API (Sonnet) is used in three places: Stage 3 naming, gender detection in alistream junk filter, and vision-based junk classification.
 
-### Deployment (Railway)
+### Deployment (Railway) — PRIMARY DEV ENVIRONMENT
+- **URL**: `https://tender-luck-production-3a77.up.railway.app`
 - **Web service**: `node server.js` — Express API + React static build from `client/dist/`
-- **Worker service**: `node alistream.js` — continuous scraper
-- **Database**: Turso (Railway filesystem is ephemeral — never use local SQLite on Railway)
+- **Worker service**: `node alistream.js` — continuous scraper (separate Railway service, optional)
+- **Database**: Turso cloud (Railway filesystem is ephemeral — never use local SQLite on Railway)
+- **Processing**: Inline mode — `REDIS_URL` is absent, Ghost Logic runs via `await processCandidate()` directly
+- **Deploy**: `git push origin main` → Railway auto-deploys (~2-3 min)
 
-Uses Turso (Railway filesystem is ephemeral). `server.js` connects to DB asynchronously after Express starts to survive Railway healthcheck timing. Native modules (`sharp`, `canvas`) declared as `optionalDependencies` so Railway build succeeds even if they fail to compile.
+Uses Turso (Railway filesystem is ephemeral). `server.js` connects to DB asynchronously after Express starts to survive Railway healthcheck timing. Native modules (`sharp`, `canvas`) declared as `optionalDependencies` so Railway build succeeds even if they fail to compile. See `CLOUD-DEV.md` for full migration guide and architecture diagram.
 
 ## Future-Facing (Do Not Build Unless Explicitly Instructed)
 
@@ -274,6 +277,16 @@ Automated editorial content generation from curated products. Not in scope for P
 - Never use promotional copy ("buy now", "sale", "limited time") — brand voice is sparse and confident.
 
 ## Current State
+
+**Cloud deployment (Railway) — live as of 2026-03-30:**
+- URL: `https://tender-luck-production-3a77.up.railway.app`
+- Health: `{"ok":true,"dbReady":true}` — Turso DB connected
+- Counts: suggested=409, staging=42, processing=10, photo_suite=3, approved=1
+- UI: fully rendering — sidebar, product cards, approve/reject/process buttons all functional
+- Processing mode: inline (no Redis) — `await processCandidate()` runs directly
+- Deploy: `git push origin main` → Railway auto-deploys (~2-3 min)
+- Missing env vars for Ghost Logic: PHOTOROOM_API_KEY, GEMINI_API_KEY, CLOUDINARY_URL
+- AliExpress CDN images blank on Railway (hotlink protection) — expected, processed Cloudinary images will work
 
 **Working:**
 - Single-connection local SQLite architecture (db.js) — fixes dual-connection row corruption
