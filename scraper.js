@@ -401,21 +401,91 @@ async function scrapeProductDetail(page, productUrl, productId) {
     await page.goto(productUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
     await page.waitForTimeout(2500);
 
+    // Expand "View More" overlays inside SKU rows BEFORE reading the DOM.
+    // AliExpress hides overflow swatches (8+ colors) behind sku-item--viewMore
+    // elements. Expanding early ensures swatch images are loaded and visible
+    // for both the initial extraction and the subsequent click loop.
+    //
+    // SAFETY: Only expand View More buttons that are inside [data-sku-row] containers.
+    // NEVER use a broad [class*="viewMore"] selector — it can match unrelated
+    // page elements (review section, description, wishlist/collection area) and
+    // cause unintended mutations like removing items from the AliExpress wishlist.
+    try {
+      const expanded = await page.evaluate(() => {
+        let count = 0;
+        // Scope: only SKU row containers (color/size pickers)
+        document.querySelectorAll("[data-sku-row]").forEach((row) => {
+          row.querySelectorAll('[class*="viewMore"], [class*="ViewMore"], [class*="view-more"]').forEach((btn) => {
+            // Safety: skip anything that looks like a wishlist/heart/remove control
+            const cls = (btn.className || "") + " " + (btn.textContent || "");
+            if (/wish|heart|fav|collect|remove|delete|trash/i.test(cls)) return;
+            btn.click();
+            count++;
+          });
+        });
+        return count;
+      });
+      if (expanded > 0) {
+        console.log(`  [${productId}] Expanded ${expanded} SKU "View More" overlay(s) before extraction`);
+        await page.waitForTimeout(600); // wait for hidden swatches to render
+      }
+    } catch (_) {}
+
     const result = await page.evaluate(() => {
       const images = new Set();
 
-      // --- Collect all candidate images from DOM ---
+      // Normalize image URLs: http→https, //→https:, strip .avif wrappers
+      const normalizeUrl = (url) => {
+        if (!url) return url;
+        if (url.startsWith("//")) url = "https:" + url;
+        if (url.startsWith("http://")) url = "https://" + url.substring(7);
+        return url;
+      };
+
+      // --- PRIMARY: Left-rail product gallery (ordered carousel images) ---
+      // AliExpress renders the main product gallery inside slider/image-view containers.
+      // These are the most important images — the official product photos in display order.
+      // Capturing these explicitly preserves gallery order even if imagePathList is missing
+      // from script tags (common on newer AliExpress page variants).
+      const galleryImages = [];
+      const gallerySelectors = [
+        '[class*="slider--slider"] img',          // 2025-2026 slider container
+        '[class*="image-view"] img',              // classic image-view container
+        '[class*="ImageView"] img',               // PascalCase variant
+        '[class*="pdp-info"] [class*="image"] img', // PDP info section
+        '[class*="gallery"] img',                 // generic gallery container
+      ];
+      const galleryHashes = new Set();
+      for (const sel of gallerySelectors) {
+        document.querySelectorAll(sel).forEach((img) => {
+          const raw = img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src");
+          const src = normalizeUrl(raw);
+          if (!src || (!src.includes("alicdn") && !src.includes("ae-pic"))) return;
+          if (!src.includes("/kf/")) return;
+          // Dedup by hash to avoid dupes from multiple matching selectors
+          const hashM = src.match(/\/kf\/([A-Za-z0-9_]+)/);
+          const h = hashM ? hashM[1] : src;
+          if (galleryHashes.has(h)) return;
+          galleryHashes.add(h);
+          galleryImages.push(src);
+          images.add(src);
+        });
+      }
+
+      // --- BROAD: All CDN images on page (catches anything the selectors missed) ---
       document.querySelectorAll(
         'img[src*="alicdn"], img[data-src*="alicdn"], img[src*="ae-pic"], img[data-src*="ae-pic"]'
       ).forEach((img) => {
-        const src = img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src");
+        const raw = img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src");
+        const src = normalizeUrl(raw);
         if (src && (src.includes("alicdn") || src.includes("ae-pic"))) images.add(src);
       });
 
       document.querySelectorAll(
         '[class*="sku"] img, [class*="variant"] img, [class*="color"] img, [class*="Sku"] img'
       ).forEach((img) => {
-        const src = img.src || img.getAttribute("data-src");
+        const raw = img.src || img.getAttribute("data-src");
+        const src = normalizeUrl(raw);
         if (src) images.add(src);
       });
 
@@ -468,7 +538,7 @@ async function scrapeProductDetail(page, productUrl, productId) {
 
           if (img) {
             name = img.alt || col.getAttribute("title") || "";
-            imgSrc = img.src || img.getAttribute("data-src") || "";
+            imgSrc = normalizeUrl(img.src || img.getAttribute("data-src") || "");
           } else {
             name = col.getAttribute("title") || col.textContent.trim();
           }
@@ -477,17 +547,25 @@ async function scrapeProductDetail(page, productUrl, productId) {
           // AliExpress swatch thumbnails: hash.jpg_220x220q75.jpg_.avif → hash.jpg
           const toFullSize = (url) =>
             url.replace(/[._]\d+x\d+q?\d*\.(?:jpg|jpeg|png|webp)_?\.?(?:avif|webp|jpg|png)?$/i, "");
+          // Check if URL is a tiny-dimension filename (e.g. /60x60.png)
+          const isTinyDimFile = (url) => {
+            const dm = url.match(/\/(\d+)x(\d+)\.\w+$/);
+            return dm && (parseInt(dm[1]) < 400 || parseInt(dm[2]) < 400);
+          };
 
           const val = { id: valueId, name };
           if (imgSrc) {
             const fullSizeImg = toFullSize(imgSrc);
-            val.image = fullSizeImg;
-            val.thumbnailImage = imgSrc; // preserve original for reference
-            images.add(fullSizeImg);
-            // Build imageGroups: "propertyId:valueId" → [image URLs]
-            const groupKey = propId + ":" + valueId;
-            if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
-            skuModel.imageGroups[groupKey].push(fullSizeImg);
+            // Skip tiny dimension filenames like /60x60.png — these are not product images
+            if (!isTinyDimFile(fullSizeImg)) {
+              val.image = fullSizeImg;
+              val.thumbnailImage = imgSrc; // preserve original for reference
+              images.add(fullSizeImg);
+              // Build imageGroups: "propertyId:valueId" → [image URLs]
+              const groupKey = propId + ":" + valueId;
+              if (!skuModel.imageGroups[groupKey]) skuModel.imageGroups[groupKey] = [];
+              skuModel.imageGroups[groupKey].push(fullSizeImg);
+            }
           }
           if (isDisabled) val.disabled = true;
 
@@ -527,7 +605,7 @@ async function scrapeProductDetail(page, productUrl, productId) {
           const urls = imgListMatch[1].match(/"(https?:\/\/[^"]+)"/g);
           if (urls) {
             urls.forEach((u) => {
-              const clean = u.replace(/"/g, "");
+              const clean = normalizeUrl(u.replace(/"/g, ""));
               images.add(clean);
               imagePathList.push(clean);
             });
@@ -551,8 +629,7 @@ async function scrapeProductDetail(page, productUrl, productId) {
                         name: val.propertyValueDisplayName || val.skuPropertyTips || val.propertyValueName || "",
                       };
                       if (val.skuPropertyImagePath) {
-                        let img = val.skuPropertyImagePath;
-                        if (img.startsWith("//")) img = "https:" + img;
+                        let img = normalizeUrl(val.skuPropertyImagePath);
                         v.image = img;
                         images.add(img);
                         const groupKey = String(prop.skuPropertyId) + ":" + v.id;
@@ -588,7 +665,8 @@ async function scrapeProductDetail(page, productUrl, productId) {
           if (skuModel.properties.length === 0) {
             const skuBlocks = text.matchAll(/"skuPropertyId"\s*:\s*"([^"]+)"[^}]*?"skuPropertyName"\s*:\s*"([^"]*)"[^}]*?"skuPropertyImagePath"\s*:\s*"(https?:\/\/[^"]+)"/g);
             for (const m of skuBlocks) {
-              const [_, propId, propName, imgUrl] = m;
+              const [_, propId, propName, rawImgUrl] = m;
+              const imgUrl = normalizeUrl(rawImgUrl);
               images.add(imgUrl);
               if (!skuModel.imageGroups[propId]) skuModel.imageGroups[propId] = [];
               skuModel.imageGroups[propId].push(imgUrl);
@@ -653,27 +731,62 @@ async function scrapeProductDetail(page, productUrl, productId) {
         if (!url || typeof url !== "string") return false;
         if (url.length < 30 || url.startsWith("data:")) return false;
         if (!url.includes("alicdn.com") && !url.includes("aliexpress-media.com")) return false;
+        // Must be a /kf/ product image — reject /tps/, /imgextra/, /bao/ platform paths
+        if (!url.includes("/kf/")) return false;
         const h = extractHash(url);
         if (h && PAGE_CHROME.has(h)) return false;
+        // Small dimension images in URL path (e.g. /64x64.png)
         if (/\/\d{1,3}x\d{1,3}\.(?:png|jpg|gif)/i.test(url)) return false;
+        // Thumbnail suffixes (e.g. _220x220. or _100x100q75.)
         if (/_\d{1,3}x\d{1,3}[._]/.test(url)) return false;
         if (/_\d{2,4}x\d{2,4}q\d+\.jpg/i.test(url)) return false;
+        // Platform chrome paths
         if (/\/ae-us\/.*?(category|nav|menu|header|footer)/i.test(url)) return false;
         if (/icon|sprite|logo|star|rating|arrow|button|banner|placeholder|avatar/i.test(url)) return false;
+        // Small platform graphics pattern: TB1...XxX-{width}-{height}.png where width<300
+        const tbDimMatch = url.match(/TB\w+-(\d+)-(\d+)\.\w+$/);
+        if (tbDimMatch && (parseInt(tbDimMatch[1]) < 300 || parseInt(tbDimMatch[2]) < 300)) return false;
         return true;
       });
 
-      const baseUrl = (u) => {
-        const m = u.match(/^(.*?\.(?:jpg|jpeg|png|webp))/i);
-        return (m ? m[1] : u).replace(/^\/\//, "https://").toLowerCase();
-      };
+      // Dedup by /kf/ hash (CDN-domain-agnostic). Same image on ae01.alicdn.com
+      // and ae-pic-a1.aliexpress-media.com shares the /kf/{hash} — dedup on hash.
+      // Order: imagePathList first (official gallery), then galleryImages (left-rail CSS),
+      // then remaining filtered images. This ensures the main product photos appear first.
       const seen = new Set();
-      const deduped = filtered.filter((url) => {
-        const key = baseUrl(url);
+      const dedupUrl = (url) => {
+        const h = extractHash(url);
+        const key = h ? h.toLowerCase() : url.toLowerCase();
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
-      });
+      };
+      // Build a hash→filteredUrl map so we can match priority sources by hash
+      const hashToFiltered = new Map();
+      for (const url of filtered) {
+        const h = extractHash(url);
+        const key = h ? h.toLowerCase() : url.toLowerCase();
+        if (!hashToFiltered.has(key)) hashToFiltered.set(key, url);
+      }
+      const deduped = [];
+      // Priority 1: imagePathList from script tags (official ordered gallery)
+      for (const url of imagePathList) {
+        const h = extractHash(url);
+        const key = h ? h.toLowerCase() : url.toLowerCase();
+        const filteredUrl = hashToFiltered.get(key);
+        if (filteredUrl && dedupUrl(filteredUrl)) deduped.push(filteredUrl);
+      }
+      // Priority 2: galleryImages from left-rail CSS selectors (captures carousel order)
+      for (const url of galleryImages) {
+        const h = extractHash(url);
+        const key = h ? h.toLowerCase() : url.toLowerCase();
+        const filteredUrl = hashToFiltered.get(key);
+        if (filteredUrl && dedupUrl(filteredUrl)) deduped.push(filteredUrl);
+      }
+      // Priority 3: remaining filtered images (swatch, broad DOM, etc.)
+      for (const url of filtered) {
+        if (dedupUrl(url)) deduped.push(url);
+      }
 
       // ==================================================================
       // BUILD legacy variantMap for backward compat
@@ -700,8 +813,20 @@ async function scrapeProductDetail(page, productUrl, productId) {
         }
       }
 
+      // Final safety: normalize all URLs, reject any remaining tiny-dimension junk
+      const finalImages = deduped
+        .map(normalizeUrl)
+        .filter((url) => {
+          if (!url || url.startsWith("http://")) return false; // must be https
+          // Final tiny-dim filename check (e.g. /60x60.png, /64x64.jpg)
+          const dimF = url.match(/\/(\d+)x(\d+)\.\w+$/);
+          if (dimF && (parseInt(dimF[1]) < 400 || parseInt(dimF[2]) < 400)) return false;
+          return true;
+        });
+
       return {
-        images: deduped,
+        images: finalImages,
+        galleryImages,
         imagePathList,
         variantMap,
         skuModel,
@@ -719,12 +844,46 @@ async function scrapeProductDetail(page, productUrl, productId) {
       (p) => p.values.some((v) => v.image)
     );
     if (colorProp && colorProp.values.length > 0) {
+      // Re-expand View More inside SKU rows in case page state reset after page.evaluate().
+      // Primary expansion happened before extraction; this is a safety net.
+      // SAFETY: scoped to [data-sku-row] containers only — never broad page selectors.
+      try {
+        await page.evaluate(() => {
+          document.querySelectorAll("[data-sku-row]").forEach((row) => {
+            row.querySelectorAll('[class*="viewMore"], [class*="ViewMore"], [class*="view-more"]').forEach((btn) => {
+              const cls = (btn.className || "") + " " + (btn.textContent || "");
+              if (/wish|heart|fav|collect|remove|delete|trash/i.test(cls)) return;
+              btn.click();
+            });
+          });
+        });
+        await page.waitForTimeout(300);
+      } catch (_) {}
+
       const perColorData = {};
       for (const val of colorProp.values) {
         const colId = `${colorProp.id}-${val.id}`;
         try {
-          // Click the swatch
-          await page.click(`[data-sku-col="${colId}"]`);
+          // SAFETY: Use DOM click via page.evaluate() as the primary method.
+          // This is safer than page.click() because:
+          //   1. No Playwright scroll-into-view (avoids viewport state changes)
+          //   2. No hit-test that could report interception by unrelated elements
+          //   3. Click is dispatched directly on the exact [data-sku-col] element
+          //   4. Cannot accidentally trigger elements outside the SKU container
+          const clicked = await page.evaluate((cid) => {
+            const el = document.querySelector(`[data-sku-col="${cid}"]`);
+            if (!el) return false;
+            // Safety: verify this element is inside a SKU row, not elsewhere on the page
+            const row = el.closest("[data-sku-row]");
+            if (!row) return false;
+            el.click();
+            return true;
+          }, colId);
+
+          if (!clicked) {
+            console.log(`  [variant] ${colId}: swatch not found in SKU row, skipping`);
+            continue;
+          }
           await page.waitForTimeout(800);
 
           // Read price + filmstrip + size availability from the live page state
@@ -743,14 +902,41 @@ async function scrapeProductDetail(page, productUrl, productId) {
             };
 
             // Capture filmstrip: small thumbnail images (50-100px width)
-            const filmHashes = [];
-            const seen = new Set();
+            // Store full URLs (not bare hashes) so they're usable for display
+            // and can be merged into all_images for split inheritance.
+            const filmUrls = [];
+            const filmSeen = new Set();
+            // Known junk hashes — same blocklist as the main gallery filter
+            const FILM_JUNK = new Set([
+              "Sa976459fb7724bf1bca6e153a425a8ebg","S9e723ca0d10848499e4e3fb33be2224do",
+              "S64c04957a1244dffbab7086d6e1a7cad7","Sb100bd23552d499c9fa8e1499f3c46dbw",
+              "S5c3261cf46fb47aa8c7f3abbdd792574S","Saf2ebe3af38947179531973d0d08ef74Y",
+              "Sd8c759485ca2404d87d8f5d5ed0d98e0K","S16183c3f12904fbbaf3f8aef523f0b73T",
+              "S9bad0c7ed77b4899ae22645df613a766r","Sa42ea28366094829a2e882420e1e269aJ",
+              "S3f91b770226a464c8baf581b22e148f7Y","S5fde9fa3ffdb45cf908380fcc49bf6771",
+              "Sa3e67595f2374efa9ce9f91574dc4650T",
+              "S98a18bcd33c34d28a0e5276b0aa20f48e","Hfff52cf71f784d99ad93c73a334e7e37a",
+            ]);
+            // Normalize: http→https, //→https:
+            const normalizeFilm = (u) => {
+              if (!u) return u;
+              if (u.startsWith("//")) u = "https:" + u;
+              if (u.startsWith("http://")) u = "https://" + u.substring(7);
+              return u;
+            };
             document.querySelectorAll("img").forEach((img) => {
-              const src = img.src || "";
+              const src = normalizeFilm(img.src || "");
+              if (!src.includes("/kf/")) return;
               const hash = (src.match(/\/kf\/([^/.]+)/) || [])[1] || "";
-              if (hash && !seen.has(hash) && img.naturalWidth >= 50 && img.naturalWidth <= 100) {
-                seen.add(hash);
-                filmHashes.push(hash);
+              if (!hash || filmSeen.has(hash) || FILM_JUNK.has(hash)) return;
+              if (img.naturalWidth >= 50 && img.naturalWidth <= 100) {
+                filmSeen.add(hash);
+                // Reconstruct full-size URL: strip thumbnail suffix, keep CDN origin
+                const fullUrl = src.replace(/[._]\d+x\d+q?\d*\.(?:jpg|jpeg|png|webp)_?\.?(?:avif|webp|jpg|png)?$/i, "");
+                // Reject tiny-dimension filenames like /60x60.png after the /kf/hash/ path
+                const dimMatch = fullUrl.match(/\/(\d+)x(\d+)\.\w+$/);
+                if (dimMatch && (parseInt(dimMatch[1]) < 400 || parseInt(dimMatch[2]) < 400)) return;
+                filmUrls.push(fullUrl);
               }
             });
 
@@ -782,7 +968,7 @@ async function scrapeProductDetail(page, productUrl, productId) {
               currentPriceText: curText,
               originalPrice: parsePrice(origText),
               originalPriceText: origText,
-              filmstripHashes: filmHashes,
+              filmstripUrls: filmUrls,
               heroHash,
               liveSizes,
             };
@@ -819,13 +1005,19 @@ async function scrapeProductDetail(page, productUrl, productId) {
           };
         }
 
-        // Attach per-color filmstrip (filtered through existing junk filter)
-        if (data.filmstripHashes.length > 0) {
-          colorGroupFilmstrips[groupKey] = data.filmstripHashes;
-          if (!firstFilmstrip) {
-            firstFilmstrip = JSON.stringify(data.filmstripHashes);
-          } else if (JSON.stringify(data.filmstripHashes) !== firstFilmstrip) {
-            allFilmstripsSame = false;
+        // Attach per-color filmstrip (full URLs, junk-filtered in page.evaluate + tiny-dim check)
+        if (data.filmstripUrls && data.filmstripUrls.length > 0) {
+          const cleanFilm = data.filmstripUrls.filter((u) => {
+            const dm = u.match(/\/(\d+)x(\d+)\.\w+$/);
+            return !(dm && (parseInt(dm[1]) < 400 || parseInt(dm[2]) < 400));
+          });
+          if (cleanFilm.length > 0) {
+            colorGroupFilmstrips[groupKey] = cleanFilm;
+            if (!firstFilmstrip) {
+              firstFilmstrip = JSON.stringify(cleanFilm);
+            } else if (JSON.stringify(cleanFilm) !== firstFilmstrip) {
+              allFilmstripsSame = false;
+            }
           }
         }
 
@@ -856,9 +1048,37 @@ async function scrapeProductDetail(page, productUrl, productId) {
         result.skuModel.colorPrices = colorGroupPrices;
       }
 
-      // Only store per-color filmstrips if they actually differ across colors
-      if (!allFilmstripsSame && Object.keys(colorGroupFilmstrips).length > 0) {
+      // Always store per-color filmstrips (full URLs) — split children need them
+      // for image inheritance even when filmstrips are shared across colors
+      if (Object.keys(colorGroupFilmstrips).length > 0) {
         result.skuModel.colorFilmstrips = colorGroupFilmstrips;
+        result.skuModel.filmstripsVaryByColor = !allFilmstripsSame;
+      }
+
+      // Merge filmstrip images into result.images (→ all_images) so they're
+      // available for split inheritance and display. Dedup by /kf/ hash.
+      // Also filter out tiny-dimension filenames (e.g. /60x60.png) that survive
+      // filmstrip capture but are not real product images.
+      const existingHashes = new Set(
+        result.images.map((u) => {
+          const m = u.match(/\/kf\/([A-Za-z0-9_]+)/);
+          return m ? m[1].toLowerCase() : u.toLowerCase();
+        })
+      );
+      for (const urls of Object.values(colorGroupFilmstrips)) {
+        for (let url of urls) {
+          // Normalize http→https
+          if (url.startsWith("http://")) url = "https://" + url.substring(7);
+          // Skip tiny-dimension filenames like /60x60.png (under 400px)
+          const dimM = url.match(/\/(\d+)x(\d+)\.\w+$/);
+          if (dimM && (parseInt(dimM[1]) < 400 || parseInt(dimM[2]) < 400)) continue;
+          const m = url.match(/\/kf\/([A-Za-z0-9_]+)/);
+          const key = m ? m[1].toLowerCase() : url.toLowerCase();
+          if (!existingHashes.has(key)) {
+            existingHashes.add(key);
+            result.images.push(url);
+          }
+        }
       }
 
       // Store per-color size availability.
@@ -874,7 +1094,7 @@ async function scrapeProductDetail(page, productUrl, productId) {
     return result;
   } catch (err) {
     console.log(`  Gallery scrape failed for ${productId}: ${err.message}`);
-    return { images: [], imagePathList: [], variantMap: {}, skuModel: { properties: [], skus: [], imageGroups: {} } };
+    return { images: [], galleryImages: [], imagePathList: [], variantMap: {}, skuModel: { properties: [], skus: [], imageGroups: {} } };
   }
 }
 
@@ -1044,6 +1264,7 @@ async function scrapeWishlistProducts(page) {
         if (match) {
           imageUrl = match[1];
           if (imageUrl && imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+          if (imageUrl && imageUrl.startsWith("http://")) imageUrl = "https://" + imageUrl.substring(7);
         }
       }
 
@@ -1110,9 +1331,25 @@ async function mainWishlist() {
   const db = getDb();
   await initSchema(db);
 
-  // Dedup against all existing candidates (cross-source to prevent any duplicate product)
-  const existingRows = await queryAll(db, "SELECT ali_product_id FROM candidates WHERE ali_product_id IS NOT NULL");
-  const existingIds = new Set(existingRows.map((r) => r.ali_product_id));
+  // Wishlist dedupe policy:
+  //   - Skip if same product is already in wishlist intake (true dup, already waiting)
+  //   - Skip if same product is already in wishlist pipeline (staged/approved/etc — already progressing)
+  //   - Revive if same product was previously wishlisted but removed (re-added to wishlist)
+  //   - Allow if product only exists from a different source (suggested, past_order, etc.)
+  //   - Split children share ali_product_id with parent — don't let them block re-scrape
+  const wishlistRows = await queryAll(db,
+    `SELECT ali_product_id, stage, id FROM candidates
+     WHERE source = 'wishlist' AND COALESCE(is_split_child, 0) != 1 AND ali_product_id IS NOT NULL`);
+  // Map: ali_product_id → { stage, id } for the most relevant wishlist row
+  const wishlistByAli = new Map();
+  for (const r of wishlistRows) {
+    const existing = wishlistByAli.get(r.ali_product_id);
+    // Keep the highest-priority row: pipeline stages > intake > removed
+    const priority = { removed: 0, intake: 1, staged: 2, approved: 3, launch_ready: 4, published: 5 };
+    if (!existing || (priority[r.stage] || 0) > (priority[existing.stage] || 0)) {
+      wishlistByAli.set(r.ali_product_id, { stage: r.stage, id: r.id });
+    }
+  }
 
   let browser;
   try {
@@ -1236,17 +1473,27 @@ async function mainWishlist() {
     // For each unique product: dedup check, download hero, scrape full gallery + SKU model.
     let added = 0;
     let skipped = 0;
+    let revived = 0;
     const skippedItems = [];
 
     for (let i = 0; i < products.length; i++) {
       const p = products[i];
 
-      // Duplicate check: skip if already in DB (any source)
-      if (p.ali_product_id && existingIds.has(p.ali_product_id)) {
-        skipped++;
-        skippedItems.push({ id: p.ali_product_id, title: p.title.substring(0, 50), reason: "already in DB" });
-        console.log(`  [${i + 1}/${products.length}] SKIP (dup): ${p.title.substring(0, 55)}...`);
-        continue;
+      // Wishlist dedupe: check against existing wishlist entries only
+      if (p.ali_product_id && wishlistByAli.has(p.ali_product_id)) {
+        const existing = wishlistByAli.get(p.ali_product_id);
+        if (existing.stage === "removed") {
+          // Previously removed wishlist item → revive back to intake with fresh data
+          // (will be handled below after scraping — flag it for UPDATE instead of INSERT)
+          p._reviveId = existing.id;
+          console.log(`  [${i + 1}/${products.length}] REVIVE: ${p.title.substring(0, 55)}... (was removed, id=${existing.id})`);
+        } else {
+          // Already in wishlist pipeline (intake, staged, approved, etc.) → skip
+          skipped++;
+          skippedItems.push({ id: p.ali_product_id, title: p.title.substring(0, 50), reason: `wishlist ${existing.stage} (id=${existing.id})` });
+          console.log(`  [${i + 1}/${products.length}] SKIP (wishlist ${existing.stage}): ${p.title.substring(0, 55)}...`);
+          continue;
+        }
       }
 
       // Download hero image locally
@@ -1266,7 +1513,14 @@ async function mainWishlist() {
       let skuDataStr = null;
       if (p.product_url) {
         const detail = await scrapeProductDetail(page, p.product_url, p.ali_product_id);
-        if (detail.images.length > 0) allImages = JSON.stringify(detail.images);
+        if (detail.images.length > 0) {
+          allImages = JSON.stringify(detail.images);
+        } else if (p.image_url) {
+          // Detail scrape failed (timeout, CAPTCHA, etc.) — store hero as minimum gallery
+          // so the item never has all_images=NULL. Can be re-scraped later.
+          console.log(`  [${p.ali_product_id}] Detail scrape returned 0 images — falling back to hero`);
+          allImages = JSON.stringify([p.image_url]);
+        }
 
         // Build enhanced variant_specifics (version 2 format)
         const hasProperties = detail.skuModel.properties.length > 0;
@@ -1301,16 +1555,34 @@ async function mainWishlist() {
       }
 
       const safePrice = (p.price != null && isFinite(p.price)) ? p.price : null;
-      await run(db,
-        `INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url,
-         status, stage, all_images, variant_specifics, created_at)
-         VALUES (?, ?, ?, 'wishlist', ?, ?, ?, 'new', 'intake', ?, ?, ?)`,
-        [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url,
-         allImages, variantSpecifics, new Date().toISOString()]
-      );
+      const now = new Date().toISOString();
 
-      if (p.ali_product_id) existingIds.add(p.ali_product_id);
-      added++;
+      if (p._reviveId) {
+        // Revive a previously removed wishlist item: UPDATE with fresh data
+        await run(db,
+          `UPDATE candidates SET
+             title = ?, image_url = ?, image_path = ?, price = ?, product_url = ?,
+             stage = 'intake', status = 'new', processing_status = NULL, review_status = NULL,
+             all_images = ?, variant_specifics = ?, updated_at = ?
+           WHERE id = ?`,
+          [p.title, p.image_url, imagePath, safePrice, p.product_url,
+           allImages, variantSpecifics, now, p._reviveId]
+        );
+        revived++;
+        console.log(`    → Revived id=${p._reviveId} back to intake with fresh gallery/SKU data`);
+      } else {
+        // New wishlist item: INSERT
+        await run(db,
+          `INSERT INTO candidates (title, image_url, image_path, source, ali_product_id, price, product_url,
+           status, stage, all_images, variant_specifics, created_at)
+           VALUES (?, ?, ?, 'wishlist', ?, ?, ?, 'new', 'intake', ?, ?, ?)`,
+          [p.title, p.image_url, imagePath, p.ali_product_id, safePrice, p.product_url,
+           allImages, variantSpecifics, now]
+        );
+        added++;
+      }
+
+      if (p.ali_product_id) wishlistByAli.set(p.ali_product_id, { stage: "intake", id: p._reviveId || 0 });
 
       const galleryCount = allImages ? JSON.parse(allImages).length : 0;
       const variantCount = variantSpecifics ? JSON.parse(variantSpecifics).properties?.length || 0 : 0;
@@ -1326,7 +1598,8 @@ async function mainWishlist() {
     console.log(`\n=== WISHLIST SCRAPE COMPLETE ===`);
     console.log(`  Discovered:  ${products.length} unique products`);
     console.log(`  Added:       ${added} new candidates`);
-    console.log(`  Skipped:     ${skipped} duplicates`);
+    console.log(`  Revived:     ${revived} previously removed`);
+    console.log(`  Skipped:     ${skipped} (already in wishlist pipeline)`);
     console.log(`  Total DB:    ${countRow[0].c} candidates`);
     console.log(`  Wishlist DB: ${wishlistCount[0].c} wishlist candidates`);
     console.log(`  Scroll rounds: ${scrollRound}`);
