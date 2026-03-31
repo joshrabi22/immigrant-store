@@ -2,9 +2,15 @@
 // Usage:
 //   1. Run: ./start-chrome.sh
 //   2. Log in to AliExpress in the Chrome window
-//   3. Run: node scraper.js
+//   3. Run: node scraper.js wishlist        (writes to cloud Turso via .env)
+//   4. Run: TURSO_DATABASE_URL= node scraper.js wishlist   (forces local SQLite)
+//
+// DB target: loads .env automatically. Set TURSO_DATABASE_URL to write to cloud.
+// Override with TURSO_DATABASE_URL= to force local SQLite.
 //
 // Connects to your real Chrome session — no bot detection issues.
+
+require("dotenv").config(); // Load .env BEFORE db.js reads TURSO_DATABASE_URL
 
 const { chromium } = require("playwright");
 const fs = require("fs");
@@ -1286,45 +1292,29 @@ async function scrapeWishlistProducts(page) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Helper: find the wishlist scroll container
-// AliExpress /p/wish-manage/ is a React SPA with a virtual-list inside a
-// scrollable div. Items only exist in DOM while visible. We must scroll
-// incrementally and scrape at each position.
-// ---------------------------------------------------------------------------
-function findScrollContainerJS() {
-  // Return JS code string to find the scroll container
-  return `
-    (() => {
-      const selectors = [
-        '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
-        '[class*="manage-list"]', '[class*="manageList"]',
-        '[class*="item-list"]', '[class*="itemList"]',
-        '[class*="product-list"]', '[class*="productList"]',
-        '[class*="scroll"]', '[class*="list-wrap"]',
-      ];
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.scrollHeight > el.clientHeight + 100) return el;
-      }
-      let best = null, bestH = 0;
-      document.querySelectorAll("div, section, ul").forEach(el => {
-        const oy = window.getComputedStyle(el).overflowY;
-        if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
-          bestH = el.scrollHeight; best = el;
-        }
-      });
-      return best;
-    })()
-  `;
-}
+async function mainWishlist({ skipPrompt = false } = {}) {
+  // --- DB TARGET BANNER ---
+  const isTurso = !!process.env.TURSO_DATABASE_URL;
+  const dbTarget = isTurso
+    ? `☁️  CLOUD (Turso): ${process.env.TURSO_DATABASE_URL.substring(0, 40)}...`
+    : `💾  LOCAL SQLite: data.db`;
 
-async function mainWishlist() {
-  console.log("=== IMMIGRANT Store — AliExpress Wishlist Scraper (Full Paginated) ===\n");
-  console.log("This scrapes your FULL wishlist from AliExpress.\n");
+  console.log("╔════════════════════════════════════════════════════════════╗");
+  console.log("║  IMMIGRANT Store — Wishlist Scraper                       ║");
+  console.log("╠════════════════════════════════════════════════════════════╣");
+  console.log(`║  DB: ${dbTarget.padEnd(53)}║`);
+  console.log("╚════════════════════════════════════════════════════════════╝\n");
+
+  if (!isTurso) {
+    console.log("  ⚠  Writing to LOCAL SQLite. To write to cloud Turso,");
+    console.log("     ensure TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are in .env\n");
+  }
+
   console.log("Make sure Chrome is running with ./start-chrome.sh and you're logged in.\n");
 
-  await waitForEnter("Press Enter when ready... ");
+  if (!skipPrompt) {
+    await waitForEnter("Press Enter when ready... ");
+  }
 
   ensureDir(CANDIDATES_IMAGES_DIR);
 
@@ -1386,13 +1376,18 @@ async function mainWishlist() {
     }
 
     // --- EXHAUSTIVE SCROLL-AND-SCRAPE ---
-    // Virtual list only renders visible items. We scroll through the entire
-    // list, scraping at each position, collecting unique product IDs.
-    // Stop after 3 consecutive scrolls yield zero new items.
-    console.log("\nStarting exhaustive scroll-and-scrape...");
+    // AliExpress wishlist uses react-infinite-scroll-component with WINDOW scroll.
+    // It loads 16 items per batch, triggered when the user scrolls past ~70% of
+    // the page height. Items accumulate in the DOM (not virtual-list recycled).
+    //
+    // Key insight: the component has no scrollableTarget/height prop — it listens
+    // for 'scroll' events on window and checks document.body.scrollHeight.
+    // CDP page.evaluate must use window.scrollTo() + dispatchEvent('scroll')
+    // to trigger loading. Container-based scrollTop DOES NOT WORK.
+    console.log("\nStarting exhaustive scroll-and-scrape (window scroll mode)...");
     const allProducts = new Map(); // ali_product_id → product data
     let noNewRounds = 0;
-    const MAX_NO_NEW = 4; // stop after 4 scrolls with no new items
+    const MAX_NO_NEW = 3; // stop after 3 scrolls with no new items
     let scrollRound = 0;
 
     // Initial scrape at current position
@@ -1407,35 +1402,44 @@ async function mainWishlist() {
     while (noNewRounds < MAX_NO_NEW) {
       scrollRound++;
 
-      // Scroll down one viewport in the container
-      await page.evaluate(() => {
-        const container = (() => {
-          const selectors = [
-            '[class*="wish-list"]', '[class*="wishList"]', '[class*="wish_list"]',
-            '[class*="manage-list"]', '[class*="manageList"]',
-            '[class*="item-list"]', '[class*="itemList"]',
-            '[class*="product-list"]', '[class*="productList"]',
-            '[class*="scroll"]', '[class*="list-wrap"]',
-          ];
-          for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el && el.scrollHeight > el.clientHeight + 100) return el;
-          }
-          let best = null, bestH = 0;
-          document.querySelectorAll("div, section, ul").forEach(el => {
-            const oy = window.getComputedStyle(el).overflowY;
-            if ((oy === "auto" || oy === "scroll") && el.scrollHeight > bestH) {
-              bestH = el.scrollHeight; best = el;
-            }
-          });
-          return best;
-        })();
-        if (container) container.scrollTop += container.clientHeight * 0.8;
-        else window.scrollBy(0, window.innerHeight * 0.8);
-      });
-      await page.waitForTimeout(1500);
+      // Snapshot DOM count before triggering load
+      const prevDomCount = await page.evaluate(
+        () => document.querySelectorAll('[data-id^="operator_"]').length
+      );
 
-      // Scrape visible items at this scroll position
+      // Scroll to 85% of the scrollable area and dispatch a scroll event.
+      // react-infinite-scroll-component fires `next` when scrollTop exceeds
+      // scrollThreshold (0.7) of (scrollHeight - clientHeight).
+      await page.evaluate(() => {
+        const scrollable = document.body.scrollHeight - window.innerHeight;
+        window.scrollTo(0, Math.floor(scrollable * 0.85));
+        window.dispatchEvent(new Event("scroll"));
+      });
+
+      // Wait for the API response and DOM update.
+      // Poll for new items appearing (up to 5s) instead of a blind timeout.
+      let loaded = false;
+      for (let tick = 0; tick < 10; tick++) {
+        await page.waitForTimeout(500);
+        const currentDomCount = await page.evaluate(
+          () => document.querySelectorAll('[data-id^="operator_"]').length
+        );
+        if (currentDomCount > prevDomCount) {
+          loaded = true;
+          break;
+        }
+      }
+
+      // If items loaded, scroll to the very bottom to render them all,
+      // then scrape. Items stay in DOM (accumulative, not virtual).
+      if (loaded) {
+        await page.evaluate(() => {
+          window.scrollTo(0, document.body.scrollHeight);
+        });
+        await page.waitForTimeout(300);
+      }
+
+      // Scrape all items currently in DOM
       const visible = await scrapeWishlistProducts(page);
       let newCount = 0;
       for (const p of visible) {
@@ -1451,7 +1455,7 @@ async function mainWishlist() {
         noNewRounds = 0;
       }
 
-      console.log(`  Round ${scrollRound}: ${visible.length} visible, +${newCount} new, ${allProducts.size} unique total (noNew: ${noNewRounds}/${MAX_NO_NEW})`);
+      console.log(`  Round ${scrollRound}: ${visible.length} in DOM, +${newCount} new, ${allProducts.size} unique total (noNew: ${noNewRounds}/${MAX_NO_NEW})`);
     }
 
     const products = Array.from(allProducts.values());
@@ -1625,12 +1629,85 @@ async function mainWishlist() {
 }
 
 // ---------------------------------------------------------------------------
+// Wishlist Refresh — soft-clear intake wishlist rows, then re-scrape
+// ---------------------------------------------------------------------------
+// SAFE: Only touches source='wishlist' AND stage='intake' (pending review).
+// Does NOT wipe staged, approved, processing, or published items.
+// After clearing, runs the full wishlist scrape to re-ingest fresh data.
+// ---------------------------------------------------------------------------
+
+async function mainWishlistRefresh() {
+  const isTurso = !!process.env.TURSO_DATABASE_URL;
+  const dbTarget = isTurso
+    ? `☁️  CLOUD (Turso): ${process.env.TURSO_DATABASE_URL.substring(0, 40)}...`
+    : `💾  LOCAL SQLite: data.db`;
+
+  console.log("╔════════════════════════════════════════════════════════════╗");
+  console.log("║  IMMIGRANT Store — Wishlist REFRESH                       ║");
+  console.log("╠════════════════════════════════════════════════════════════╣");
+  console.log(`║  DB: ${dbTarget.padEnd(53)}║`);
+  console.log("╚════════════════════════════════════════════════════════════╝\n");
+
+  if (!isTurso) {
+    console.log("  ⚠  Operating on LOCAL SQLite. To refresh cloud Turso,");
+    console.log("     ensure TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are in .env\n");
+  }
+
+  const db = getDb();
+  await initSchema(db);
+
+  // Show what will be affected BEFORE doing anything
+  const intakeCount = await queryAll(db,
+    "SELECT COUNT(*) as c FROM candidates WHERE source = 'wishlist' AND stage = 'intake'");
+  const stagedCount = await queryAll(db,
+    "SELECT COUNT(*) as c FROM candidates WHERE source = 'wishlist' AND stage = 'staged'");
+  const approvedCount = await queryAll(db,
+    "SELECT COUNT(*) as c FROM candidates WHERE source = 'wishlist' AND stage = 'approved'");
+  const removedCount = await queryAll(db,
+    "SELECT COUNT(*) as c FROM candidates WHERE source = 'wishlist' AND stage = 'removed'");
+
+  console.log("Current wishlist state:");
+  console.log(`  intake:   ${intakeCount[0].c} ← THESE WILL BE SOFT-DELETED (stage → 'removed')`);
+  console.log(`  staged:   ${stagedCount[0].c} — untouched`);
+  console.log(`  approved: ${approvedCount[0].c} — untouched`);
+  console.log(`  removed:  ${removedCount[0].c} — untouched`);
+  console.log();
+
+  console.log("Make sure Chrome is running with ./start-chrome.sh and you're logged in.\n");
+
+  if (intakeCount[0].c === 0) {
+    console.log("No intake wishlist items to clear. Proceeding directly to scrape.\n");
+    await waitForEnter("Press Enter when ready... ");
+  } else {
+    await waitForEnter(`This will soft-delete ${intakeCount[0].c} wishlist intake items. Press Enter to confirm... `);
+
+    // Soft-delete: move intake→removed (not a hard DELETE)
+    const now = new Date().toISOString();
+    const result = await run(db,
+      `UPDATE candidates SET stage = 'removed', updated_at = ?
+       WHERE source = 'wishlist' AND stage = 'intake'`,
+      [now]
+    );
+    console.log(`✓ Soft-deleted ${result.changes} wishlist intake items (moved to 'removed')\n`);
+  }
+
+  // Now run the normal wishlist scrape — it will re-ingest everything
+  // The dedupe logic will revive removed items and skip still-active ones
+  console.log("Starting fresh wishlist scrape...\n");
+  await mainWishlist({ skipPrompt: true });
+}
+
+// ---------------------------------------------------------------------------
 // Entry point — dispatch based on CLI argument
 // ---------------------------------------------------------------------------
 
 const mode = process.argv[2];
+const subMode = process.argv[3]; // e.g. "wishlist refresh"
+
 if (mode === "suggested") {
   mainSuggested();
+} else if (mode === "wishlist" && subMode === "refresh") {
+  mainWishlistRefresh();
 } else if (mode === "wishlist") {
   mainWishlist();
 } else {

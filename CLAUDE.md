@@ -158,7 +158,7 @@ Post-pipeline sequencing: ingestion → quality filter → Photo Suite (Ghost Lo
 
 **Worker debug logging:** Final success UPDATE in `processCandidate()` logs SQL + all parameter indices with column labels. `directProcess()` verification checks 12 critical columns with corruption detectors (non-ISO timestamps, stage not in valid set). This logging is retained as a diagnostic safety net.
 
-Caps: `MAX_STAGE1_IMAGES = 3`, `MAX_STAGE2 = 3`. Overflow images are dropped, not processed.
+Caps: `MAX_STAGE1_IMAGES = 12`, `MAX_STAGE2 = 12` (env-configurable). After gallery junk filter + dedup + product gate, typical surviving count is 3-8. The cap is a safety ceiling against runaway API spend, not a product-level image limit.
 
 **Photo Suite quality rules** (applied inside `processCandidate()`):
 0. Gallery junk filter: `filterGallery()` from `server/lib/galleryFilter.js` removes page chrome, structural junk, non-CDN URLs BEFORE any other processing. Same 3-layer logic as client filter. Without this, Photoroom+Gemini hallucinate foreign products from junk inputs.

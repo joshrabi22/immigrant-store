@@ -429,10 +429,12 @@ async function processCandidate(candidateId, db) {
     console.log(`[ghost][${candidateId}] processing_status → processing (rows updated: ${startAffected})`);
   }
 
-  // Cap Stage 1 (extraction) and Stage 2 (Gemini) to the first N images.
-  // Overflow images are dropped entirely — no remove.bg quota spent, no raw originals in processedUrls.
-  const MAX_STAGE1 = parseInt(process.env.MAX_STAGE1_IMAGES || "3", 10);
-  const MAX_STAGE2 = parseInt(process.env.MAX_STAGE2_IMAGES || "3", 10);
+  // Safety caps for Stage 1 (extraction) and Stage 2 (Gemini compositing).
+  // After gallery filtering + dedup + product gate, typical count is 3-8 real images.
+  // Default 12 covers generous multi-angle + color-specific shots while preventing
+  // runaway API spend on malformed galleries. Override via env vars if needed.
+  const MAX_STAGE1 = parseInt(process.env.MAX_STAGE1_IMAGES || "12", 10);
+  const MAX_STAGE2 = parseInt(process.env.MAX_STAGE2_IMAGES || "12", 10);
 
   try {
     // Two-pass pipeline:

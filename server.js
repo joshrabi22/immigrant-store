@@ -612,11 +612,15 @@ app.get("/api/staging/:id/variants", requireDb, async (req, res) => {
           // Use per-color price when present
           const colorPrice = variantData.colorPrices?.[groupKey] || null;
 
+          // Per-color filmstrip images (full URLs)
+          const colorFilmstrip = variantData.colorFilmstrips?.[groupKey] || [];
+
           enriched.summary.colorways.push({
             variantId: groupKey,
             name: val.name || val.tips || "Unknown",
             image: val.image,
-            imageCount: groupImages.length,
+            imageCount: groupImages.length + colorFilmstrip.length,
+            filmstripImages: colorFilmstrip,
             skuCount: matchingSkus.length,
             sizes,
             liveSizes,
@@ -764,9 +768,57 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
     let parentGallery = [];
     try { parentGallery = JSON.parse(parent.all_images || "[]"); } catch (_) {}
     const cleanUrl = (u) => { const m = (u || "").match(/^(.*?\.(?:jpg|jpeg|png))/i); return m ? m[1] : u; };
+    const imgHash = (u) => { const m = (u || "").match(/\/kf\/([A-Za-z0-9_]+)/); return m ? m[1].toLowerCase() : cleanUrl(u).toLowerCase(); };
     const splitCleaned = cleanUrl(image_url);
     const updatedGallery = parentGallery.filter((u) => cleanUrl(u) !== splitCleaned && u !== image_url);
     const newHero = updatedGallery.length > 0 ? updatedGallery[0] : null;
+
+    // Build child gallery: hero + color-specific images + shared product images
+    // For a split child, "all_images" should contain every image the child needs,
+    // NOT just the hero. This means:
+    //   1. Color hero (image_url)
+    //   2. Color-specific imageGroup images
+    //   3. Color-specific filmstrip images
+    //   4. Shared product images (not belonging to any specific color)
+    let childGallery = [image_url];
+    if (parentVariantData && parentVariantData.version === 2 && variant_id) {
+      const childSeen = new Set([imgHash(image_url)]);
+
+      // Add color-specific images from imageGroups
+      const groupImages = parentVariantData.imageGroups?.[variant_id] || [];
+      for (const url of groupImages) {
+        const h = imgHash(url);
+        if (!childSeen.has(h)) { childSeen.add(h); childGallery.push(url); }
+      }
+
+      // Add color-specific filmstrip images
+      const filmImages = parentVariantData.colorFilmstrips?.[variant_id] || [];
+      for (const url of filmImages) {
+        if (!url || !url.startsWith("http")) continue; // skip bare hashes from old data
+        const h = imgHash(url);
+        if (!childSeen.has(h)) { childSeen.add(h); childGallery.push(url); }
+      }
+
+      // Identify all color-specific image hashes (across ALL colors) to find shared images
+      const allColorHashes = new Set();
+      for (const [, imgs] of Object.entries(parentVariantData.imageGroups || {})) {
+        for (const url of imgs) allColorHashes.add(imgHash(url));
+      }
+      for (const [, imgs] of Object.entries(parentVariantData.colorFilmstrips || {})) {
+        for (const url of imgs) {
+          if (url && url.startsWith("http")) allColorHashes.add(imgHash(url));
+        }
+      }
+
+      // Shared product images: parent gallery images not owned by any color
+      for (const url of parentGallery) {
+        const h = imgHash(url);
+        if (!childSeen.has(h) && !allColorHashes.has(h)) {
+          childSeen.add(h);
+          childGallery.push(url);
+        }
+      }
+    }
 
     // Open a write transaction — all changes commit or rollback together
     const tx = await db.transaction("write");
@@ -803,7 +855,7 @@ app.post("/api/staging/:id/split", requireDb, async (req, res) => {
                 staged_at, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', NULL, NULL, ?, ?, 1, ?, ?, ?, ?)`,
         args: [
-          parent.title, image_url, JSON.stringify([image_url]),
+          parent.title, image_url, JSON.stringify(childGallery),
           parent.source, parent.ali_product_id, parent.product_url,
           parent.price, parent.shipping_cost, parent.gender, parent.detected_category,
           parent.id, splitGroupId, variantSpecifics,
